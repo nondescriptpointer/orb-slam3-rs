@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use nalgebra::{Isometry3, Matrix2x1, Matrix2x3, Matrix3, Point2, Point3, Vector3};
 use opencv::core::{KeyPoint, Mat, Point2f, Point3f};
 
+use crate::two_view_reconstruction::ReconstructResult;
+
 pub mod kannala_brandt8;
 pub mod pinhole;
 
@@ -43,14 +45,12 @@ trait GeometricCamera {
     fn project_jac(&self, p3d: &Point3<f64>) -> Matrix2x3<f64>;
 
     fn reconstruct_with_two_views(
-        &self,
+        &mut self,
         keys1: &Vec<KeyPoint>,
         keys2: &Vec<KeyPoint>,
-        matches: &Vec<usize>,
-        t21: &Isometry3<f32>,
+        matches: &Vec<Option<usize>>,
         p3d: &Vec<Point3f>,
-        triangulated: &Vec<bool>,
-    ) -> bool;
+    ) -> Option<ReconstructResult>;
 
     fn to_k(&self) -> Mat;
     fn to_k_n(&self) -> Matrix3<f32>;

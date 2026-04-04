@@ -37,7 +37,7 @@ struct SendKeyPoints<'a>(&'a [KeyPoint]);
 unsafe impl Send for SendKeyPoints<'_> {}
 unsafe impl Sync for SendKeyPoints<'_> {}
 
-struct ReconstructResult {
+pub struct ReconstructResult {
     t21: Isometry3<f32>,
     triangulated: Vec<bool>,
 }
@@ -57,16 +57,32 @@ impl TwoViewReconstruction {
         }
     }
 
+    pub fn from_k(k: Matrix3<f32>) -> Self {
+        let sigma = 1.0;
+        let iterations = 200;
+        TwoViewReconstruction {
+            keys1: Vec::new(),
+            keys2: Vec::new(),
+            matches12: Vec::new(),
+            matched1: Vec::new(),
+            k: k,
+            sigma: sigma,
+            sigma2: sigma * sigma,
+            max_iterations: iterations,
+            sets: Vec::new(),
+        }
+    }
+
     // Computes in parallel a fundamental matrix and a homography
     // Selects a model and tries to recover the motion and the structure from motion
-    fn reconstruct(
+    pub fn reconstruct(
         &mut self,
-        keys1: Vec<KeyPoint>,
-        keys2: Vec<KeyPoint>,
+        keys1: &[KeyPoint],
+        keys2: &[KeyPoint],
         matches12: &[Option<usize>],
     ) -> Option<ReconstructResult> {
-        self.keys1 = keys1;
-        self.keys2 = keys2;
+        self.keys1 = keys1.to_vec();
+        self.keys2 = keys2.to_vec();
 
         // Fill structure with current keypoints and matches with reference frame
         self.matches12.clear();
@@ -1207,7 +1223,7 @@ mod tests {
         let mut tvr = TwoViewReconstruction::new(scene.k, 1.0, 500);
         let matches: Vec<Option<usize>> = parallel_matches(scene.keys1.len());
 
-        let Some(result) = tvr.reconstruct(scene.keys1, scene.keys2, &matches) else {
+        let Some(result) = tvr.reconstruct(&scene.keys1, &scene.keys2, &matches) else {
             panic!("expected reconstruct to succeed");
         };
 
@@ -1235,7 +1251,7 @@ mod tests {
         let mut tvr = TwoViewReconstruction::new(scene.k, 1.0, 500);
         let matches: Vec<Option<usize>> = parallel_matches(scene.keys1.len());
 
-        let Some(result) = tvr.reconstruct(scene.keys1, scene.keys2, &matches) else {
+        let Some(result) = tvr.reconstruct(&scene.keys1, &scene.keys2, &matches) else {
             panic!("expected reconstruct to succeed");
         };
 
@@ -1269,7 +1285,7 @@ mod tests {
         }
         let matches = parallel_matches(20);
 
-        assert!(tvr.reconstruct(keys1, keys2, &matches).is_none());
+        assert!(tvr.reconstruct(&keys1, &keys2, &matches).is_none());
     }
 
     #[test]
@@ -1292,6 +1308,6 @@ mod tests {
         }
         let matches = parallel_matches(60);
 
-        assert!(tvr.reconstruct(keys1, keys2, &matches).is_none());
+        assert!(tvr.reconstruct(&keys1, &keys2, &matches).is_none());
     }
 }

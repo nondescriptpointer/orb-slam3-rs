@@ -1,6 +1,6 @@
 # orb-slam3-rs
 
-This is a Rust reimplementation of ORB-SLAM3. The original ORB-SLAM3 is currently unmaintained and hard to build on newer systems. This project aims to provide an easier way to run and integrate ORB-SLAM3 into your projects. It follows the ORB-SLAM3 structure closely while changing some language implementation specific things to be more Rust idiomatic.
+Rust reimplementation of ORB-SLAM3. The original C++ ORB-SLAM3 is currently unmaintained and hard to build on newer systems. This project aims to provide an easier way to run and integrate ORB-SLAM3 into your projects. It follows the general ORB-SLAM3 structure closely while trying to be idiomatic, safe Rust.
 
 **Authors:** Carlos Campos, Richard Elvira, Juan J. Gómez Rodríguez, [José M. M. Montiel](http://webdiis.unizar.es/~josemari/), [Juan D. Tardos](http://webdiis.unizar.es/~jdtardos/).
 

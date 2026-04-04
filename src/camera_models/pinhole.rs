@@ -1,16 +1,14 @@
 use crate::camera_models::{GeometricCamera, Type, next_geometric_camera_id};
+use crate::two_view_reconstruction::{ReconstructResult, TwoViewReconstruction};
 
 use nalgebra::{Matrix2x3, Matrix3, Point2, Point3};
 use opencv::core::{KeyPointTraitConst, Mat, Point2f, Point3f};
-use sophus::autodiff::linalg::VecF64;
-use sophus::autodiff::prelude::IsVector;
-use sophus::lie::Rotation3F64;
 
 struct Pinhole {
     parameters: Vec<f32>,
     id: u64,
     camera_type: Type,
-    //two_view_reconstruction: TODO
+    tvr: Option<TwoViewReconstruction>,
 }
 
 impl GeometricCamera for Pinhole {
@@ -22,6 +20,7 @@ impl GeometricCamera for Pinhole {
             parameters: Vec::with_capacity(4),
             id: next_geometric_camera_id(),
             camera_type: Type::Pinhole,
+            tvr: None,
         }
     }
     fn from_params(params: Vec<f32>) -> Self
@@ -35,6 +34,7 @@ impl GeometricCamera for Pinhole {
             parameters: params,
             id: next_geometric_camera_id(),
             camera_type: Type::Pinhole,
+            tvr: None,
         }
     }
     fn as_any(&self) -> &dyn std::any::Any {
@@ -95,16 +95,21 @@ impl GeometricCamera for Pinhole {
     }
 
     fn reconstruct_with_two_views(
-        &self,
+        &mut self,
         keys1: &Vec<opencv::core::KeyPoint>,
         keys2: &Vec<opencv::core::KeyPoint>,
-        matches: &Vec<usize>,
-        t21: &nalgebra::Isometry3<f32>,
+        matches: &Vec<Option<usize>>,
         p3d: &Vec<Point3f>,
-        triangulated: &Vec<bool>,
-    ) -> bool {
-        // TODO
-        true
+    ) -> Option<ReconstructResult> {
+        if self.tvr.is_none() {
+            let k = self.to_k_n();
+            self.tvr = Some(TwoViewReconstruction::from_k(k));
+        }
+        if let Some(tvr) = &mut self.tvr {
+            tvr.reconstruct(&keys1, &keys2, matches)
+        } else {
+            None
+        }
     }
 
     fn to_k(&self) -> Mat {
@@ -138,10 +143,7 @@ impl GeometricCamera for Pinhole {
         unc: f32,
     ) -> bool {
         // Compute fundamental Matrix
-        // `Rotation3::hat` is only available for `f64` in sophus (`IsScalar`); promote, then cast back.
-        // TODO: optimize
-        let omega = VecF64::<3>::from_array([t12[0] as f64, t12[1] as f64, t12[2] as f64]);
-        let t12x = Rotation3F64::hat(omega).map(|v| v as f32);
+        let t12x = t12.coords.cross_matrix();
         let k1 = self.to_k_n();
         let k2 = other_camera.to_k_n();
         let f12 = k1.transpose().try_inverse().unwrap() * t12x * r12 * k2.try_inverse().unwrap();
@@ -201,6 +203,7 @@ impl Pinhole {
             parameters: other.parameters.clone(),
             id: next_geometric_camera_id(),
             camera_type: Type::Pinhole,
+            tvr: None,
         }
     }
 

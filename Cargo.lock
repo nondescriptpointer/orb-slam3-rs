@@ -2759,6 +2759,7 @@ dependencies = [
  "nalgebra",
  "opencv",
  "rand 0.10.0",
+ "rayon",
  "sophus",
  "tracing",
  "tracing-subscriber",

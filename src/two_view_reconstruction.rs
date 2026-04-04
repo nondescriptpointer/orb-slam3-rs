@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use std::thread;
-
 use nalgebra::{
     DMatrix, Isometry3, Matrix3, Rotation3, SMatrix, SVD, Translation3, UnitQuaternion, Vector3,
 };
@@ -11,10 +8,6 @@ use rand::rngs::StdRng;
 use rand::seq::index;
 
 use crate::geometric_tools::triangulate;
-
-// TODO: threading
-// TODO: let Opus compare
-// TODO: suggest idiomatic improvements
 
 pub struct TwoViewReconstruction {
     // Keypoints reference frame (1)
@@ -34,6 +27,15 @@ pub struct TwoViewReconstruction {
     // Ransac sets
     sets: Vec<Vec<usize>>,
 }
+
+/// Wrapper to send &KeyPoint across thread boundaries.
+/// KeyPoint contains a `*mut c_void` from the OpenCV C++ FFI, making it !Sync.
+/// The fields we access (pt, size, angle, etc.) are plain data that is safe to read
+/// concurrently. We only share immutable references, so no data races should occur in this context.
+#[derive(Clone, Copy)]
+struct SendKeyPoints<'a>(&'a [KeyPoint]);
+unsafe impl Send for SendKeyPoints<'_> {}
+unsafe impl Sync for SendKeyPoints<'_> {}
 
 struct ReconstructResult {
     t21: Isometry3<f32>,
@@ -90,47 +92,16 @@ impl TwoViewReconstruction {
             }
         }
 
-        // Launch threads to compute in parallel a fundamental matrix and a homography
-        // TODO: other threading model here?
-        // TODO: original code does not copy here, might need optimizations
-        // TODO: the keys are not thread safe so there is some duplicated logic in find_homography and find_fundamental unfortunately..
-        let (homography, fundamental) = {
-            let local_matches12 = Arc::new(self.matches12.clone());
-            let local_keys1 = self.keys1.clone();
-            let local_keys2 = self.keys2.clone();
-            let local_sets = Arc::new(self.sets.clone());
-            let max_iterations = self.max_iterations;
-            let sigma = self.sigma;
-            let h_matches12 = local_matches12.clone();
-            let h_local_sets = local_sets.clone();
-            let thread_h = thread::spawn(move || {
-                find_homography(
-                    h_matches12,
-                    local_keys1,
-                    local_keys2,
-                    h_local_sets,
-                    max_iterations,
-                    sigma,
-                )
-            });
-            let local_keys1 = self.keys1.clone();
-            let local_keys2 = self.keys2.clone();
-            let thread_f = thread::spawn(move || {
-                find_fundamental(
-                    local_matches12,
-                    local_keys1,
-                    local_keys2,
-                    local_sets.clone(),
-                    max_iterations,
-                    sigma,
-                )
-            });
-
-            // Wait until threads are finished
-            let homography = thread_h.join().unwrap();
-            let fundamental = thread_f.join().unwrap();
-            (homography, fundamental)
-        };
+        let matches12 = &self.matches12;
+        let keys1 = SendKeyPoints(&self.keys1);
+        let keys2 = SendKeyPoints(&self.keys2);
+        let sets = &self.sets;
+        let max_iterations = self.max_iterations;
+        let sigma = self.sigma;
+        let (homography, fundamental) = rayon::join(
+            move || find_homography(matches12, keys1, keys2, sets, max_iterations, sigma),
+            move || find_fundamental(matches12, keys1, keys2, sets, max_iterations, sigma),
+        );
 
         // Compute ratio of scores
         if homography.score + fundamental.score == 0. {
@@ -367,7 +338,7 @@ impl TwoViewReconstruction {
     }
 }
 
-fn normalize(keys: &Vec<KeyPoint>) -> (Vec<Point2f>, Matrix3<f32>) {
+fn normalize(keys: &[KeyPoint]) -> (Vec<Point2f>, Matrix3<f32>) {
     let n = keys.len();
     let mut normalized_points = Vec::<Point2f>::with_capacity(n);
 
@@ -406,7 +377,7 @@ fn normalize(keys: &Vec<KeyPoint>) -> (Vec<Point2f>, Matrix3<f32>) {
     (normalized_points, t)
 }
 
-fn compute_h21(p1: &Vec<Point2f>, p2: &Vec<Point2f>) -> Matrix3<f32> {
+fn compute_h21(p1: &[Point2f], p2: &[Point2f]) -> Matrix3<f32> {
     let n = p1.len();
     let mut a = DMatrix::<f32>::zeros(2 * n, 9);
 
@@ -456,7 +427,7 @@ fn compute_h21(p1: &Vec<Point2f>, p2: &Vec<Point2f>) -> Matrix3<f32> {
     ])
 }
 
-fn compute_f21(p1: &Vec<Point2f>, p2: &Vec<Point2f>) -> Matrix3<f32> {
+fn compute_f21(p1: &[Point2f], p2: &[Point2f]) -> Matrix3<f32> {
     let n = p1.len();
     let mut a = DMatrix::<f32>::zeros(n, 9);
 
@@ -506,19 +477,18 @@ struct HomographyResult {
     h21: Matrix3<f32>,
 }
 fn find_homography(
-    matches12: Arc<Vec<(usize, usize)>>,
-    keys1: Vec<KeyPoint>,
-    keys2: Vec<KeyPoint>,
-    sets: Arc<Vec<Vec<usize>>>,
+    matches12: &[(usize, usize)],
+    keys1: SendKeyPoints<'_>,
+    keys2: SendKeyPoints<'_>,
+    sets: &[Vec<usize>],
     max_iterations: u32,
     sigma: f32,
 ) -> HomographyResult {
-    // number of putative matches
+    let (keys1, keys2) = (keys1.0, keys2.0);
     let n = matches12.len();
 
-    // normalize coordinates
-    let (pn1, t1) = normalize(&keys1);
-    let (pn2, t2) = normalize(&keys2);
+    let (pn1, t1) = normalize(keys1);
+    let (pn2, t2) = normalize(keys2);
     let t2inv = t2.try_inverse().unwrap();
 
     // best results
@@ -546,7 +516,7 @@ fn find_homography(
         h12_i = h21_i.try_inverse().unwrap();
 
         (current_score, current_inliers) =
-            check_homography(matches12.as_ref(), &keys1, &keys2, &h21_i, &h12_i, sigma);
+            check_homography(matches12, keys1, keys2, &h21_i, &h12_i, sigma);
 
         if current_score > score {
             h21 = h21_i;
@@ -619,19 +589,18 @@ struct FundamentalResult {
     f21: Matrix3<f32>,
 }
 fn find_fundamental(
-    matches12: Arc<Vec<(usize, usize)>>,
-    keys1: Vec<KeyPoint>,
-    keys2: Vec<KeyPoint>,
-    sets: Arc<Vec<Vec<usize>>>,
+    matches12: &[(usize, usize)],
+    keys1: SendKeyPoints<'_>,
+    keys2: SendKeyPoints<'_>,
+    sets: &[Vec<usize>],
     max_iterations: u32,
     sigma: f32,
 ) -> FundamentalResult {
-    // number of putative matches
+    let (keys1, keys2) = (keys1.0, keys2.0);
     let n = matches12.len();
 
-    // mormalized coordinates
-    let (pn1, t1) = normalize(&keys1);
-    let (pn2, t2) = normalize(&keys2);
+    let (pn1, t1) = normalize(keys1);
+    let (pn2, t2) = normalize(keys2);
     let t2t = t2.transpose();
 
     // best result
@@ -657,8 +626,7 @@ fn find_fundamental(
         let f = compute_h21(&pn1_i, &pn2_i);
         f21i = t2t * f * t1;
 
-        (current_score, current_inliers) =
-            check_fundamental(&matches12, &keys1, &keys2, &f21i, sigma);
+        (current_score, current_inliers) = check_fundamental(matches12, keys1, keys2, &f21i, sigma);
 
         if current_score > score {
             f21 = f21i;
@@ -737,8 +705,8 @@ struct RTResult {
 fn check_rt(
     r: &Matrix3<f32>,
     t: &Vector3<f32>,
-    keys1: &Vec<KeyPoint>,
-    keys2: &Vec<KeyPoint>,
+    keys1: &[KeyPoint],
+    keys2: &[KeyPoint],
     matches12: &[(usize, usize)],
     matches_inliers: &[bool],
     k: &Matrix3<f32>,

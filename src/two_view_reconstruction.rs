@@ -360,6 +360,17 @@ fn normalize(keys: &[KeyPoint]) -> (Vec<Point2f>, Matrix3<f32>) {
     mean_dev_x = mean_dev_x / n as f32;
     mean_dev_y = mean_dev_y / n as f32;
 
+    // Guard against degenerate (collinear) point sets where all coordinates
+    // along one axis are identical, producing zero mean deviation. Without
+    // this check `1.0 / 0.0 = inf` poisons every downstream matrix with NaN,
+    // causing the iterative SVD to loop forever.
+    if mean_dev_x < f32::EPSILON {
+        mean_dev_x = 1.0;
+    }
+    if mean_dev_y < f32::EPSILON {
+        mean_dev_y = 1.0;
+    }
+
     let s_x = 1.0 / mean_dev_x;
     let s_y = 1.0 / mean_dev_y;
     for it in normalized_points.iter_mut() {
@@ -429,7 +440,11 @@ fn compute_h21(p1: &[Point2f], p2: &[Point2f]) -> Matrix3<f32> {
 
 fn compute_f21(p1: &[Point2f], p2: &[Point2f]) -> Matrix3<f32> {
     let n = p1.len();
-    let mut a = DMatrix::<f32>::zeros(n, 9);
+    // Pad rows to at least 9 so the thin SVD produces a full 9×9 Vᵀ.
+    // nalgebra only computes thin SVD: Vᵀ is min(rows,9) × 9. With fewer
+    // than 9 rows the null-space vector (column 8 of V) is never returned.
+    let nrows = n.max(9);
+    let mut a = DMatrix::<f32>::zeros(nrows, 9);
 
     for i in 0..n {
         let u1 = p1[i].x;
@@ -450,7 +465,7 @@ fn compute_f21(p1: &[Point2f], p2: &[Point2f]) -> Matrix3<f32> {
 
     let svd = a.svd(false, true);
     let v_t = svd.v_t.expect("svd: V^T not computed");
-    let k = svd.singular_values.len() - 1;
+    let k = v_t.nrows() - 1;
     let f_pre = Matrix3::from_row_slice(&[
         v_t[(k, 0)],
         v_t[(k, 1)],
@@ -513,7 +528,10 @@ fn find_homography(
 
         let hn = compute_h21(&pn1_i, &pn2_i);
         h21_i = t2inv * hn * t1;
-        h12_i = h21_i.try_inverse().unwrap();
+        let Some(inv) = h21_i.try_inverse() else {
+            continue;
+        };
+        h12_i = inv;
 
         (current_score, current_inliers) =
             check_homography(matches12, keys1, keys2, &h21_i, &h12_i, sigma);
@@ -623,7 +641,7 @@ fn find_fundamental(
             pn2_i[j] = pn2[matches12[idx].1];
         }
 
-        let f = compute_h21(&pn1_i, &pn2_i);
+        let f = compute_f21(&pn1_i, &pn2_i);
         f21i = t2t * f * t1;
 
         (current_score, current_inliers) = check_fundamental(matches12, keys1, keys2, &f21i, sigma);
@@ -719,7 +737,7 @@ fn check_rt(
     let cy = k[(1, 2)];
 
     let mut good = vec![false; keys1.len()];
-    let mut p3d = Vec::with_capacity(keys1.len());
+    let mut p3d = vec![Point3f::new(0.0, 0.0, 0.0); keys1.len()];
 
     let mut v_cos_parallax = Vec::<f32>::with_capacity(keys1.len());
 
@@ -849,4 +867,431 @@ fn pose_from_rt(r: &nalgebra::Matrix3<f32>, t: &nalgebra::Vector3<f32>) -> Isome
         Translation3::from(*t),
         UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(*r)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::f32::consts::PI;
+
+    use nalgebra::{Matrix3, Rotation3, Unit, Vector2, Vector3};
+    use opencv::core::{KeyPoint, KeyPointTraitConst, Point2f};
+    use rand::RngExt;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    use super::*;
+
+    fn make_k(fx: f32, fy: f32, cx: f32, cy: f32) -> Matrix3<f32> {
+        Matrix3::new(fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0)
+    }
+
+    fn skew_symmetric(v: &Vector3<f32>) -> Matrix3<f32> {
+        Matrix3::new(0.0, -v.z, v.y, v.z, 0.0, -v.x, -v.y, v.x, 0.0)
+    }
+
+    fn make_kp(x: f32, y: f32) -> KeyPoint {
+        KeyPoint::new_point_def(Point2f::new(x, y), 1.0).expect("KeyPoint::new_point_def")
+    }
+
+    fn project(
+        k: &Matrix3<f32>,
+        r: &Matrix3<f32>,
+        t: &Vector3<f32>,
+        pw: &Vector3<f32>,
+    ) -> Vector2<f32> {
+        let pc = r * pw + t;
+        let uv = k * pc;
+        Vector2::new(uv.x / uv.z, uv.y / uv.z)
+    }
+
+    struct SyntheticScene {
+        k: Matrix3<f32>,
+        r: Matrix3<f32>,
+        t: Vector3<f32>,
+        keys1: Vec<KeyPoint>,
+        keys2: Vec<KeyPoint>,
+    }
+
+    fn build_general_scene(n_points: i32, seed: u64) -> SyntheticScene {
+        let mut s = SyntheticScene {
+            k: make_k(500.0, 500.0, 320.0, 240.0),
+            r: *Rotation3::from_axis_angle(&Vector3::y_axis(), 10.0_f32.to_radians()).matrix(),
+            t: Vector3::new(0.6, 0.0, 0.0),
+            keys1: Vec::new(),
+            keys2: Vec::new(),
+        };
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        let i = Matrix3::identity();
+        let z0 = Vector3::zeros();
+
+        for _ in 0..n_points {
+            let pw = Vector3::new(
+                rng.random_range(-1.5..1.5),
+                rng.random_range(-1.5..1.5),
+                rng.random_range(3.0..8.0),
+            );
+            let uv1 = project(&s.k, &i, &z0, &pw);
+            let uv2 = project(&s.k, &s.r, &s.t, &pw);
+
+            if uv1.x < 0.0
+                || uv1.x > 640.0
+                || uv1.y < 0.0
+                || uv1.y > 480.0
+                || uv2.x < 0.0
+                || uv2.x > 640.0
+                || uv2.y < 0.0
+                || uv2.y > 480.0
+            {
+                continue;
+            }
+
+            s.keys1.push(make_kp(uv1.x, uv1.y));
+            s.keys2.push(make_kp(uv2.x, uv2.y));
+        }
+
+        s
+    }
+
+    fn build_planar_scene(n_points: i32, seed: u64) -> SyntheticScene {
+        let mut s = SyntheticScene {
+            k: make_k(500.0, 500.0, 320.0, 240.0),
+            r: *Rotation3::from_axis_angle(&Vector3::y_axis(), 8.0_f32.to_radians()).matrix(),
+            t: Vector3::new(0.8, 0.0, 0.1),
+            keys1: Vec::new(),
+            keys2: Vec::new(),
+        };
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        let i = Matrix3::identity();
+        let z0 = Vector3::zeros();
+        let z_plane = 4.0_f32;
+
+        for _ in 0..n_points {
+            let pw = Vector3::new(
+                rng.random_range(-1.5..1.5),
+                rng.random_range(-1.5..1.5),
+                z_plane + rng.random_range(-0.05..0.05),
+            );
+            let uv1 = project(&s.k, &i, &z0, &pw);
+            let uv2 = project(&s.k, &s.r, &s.t, &pw);
+
+            if uv1.x < 10.0
+                || uv1.x > 630.0
+                || uv1.y < 10.0
+                || uv1.y > 470.0
+                || uv2.x < 10.0
+                || uv2.x > 630.0
+                || uv2.y < 10.0
+                || uv2.y > 470.0
+            {
+                continue;
+            }
+
+            s.keys1.push(make_kp(uv1.x, uv1.y));
+            s.keys2.push(make_kp(uv2.x, uv2.y));
+        }
+
+        s
+    }
+
+    fn parallel_matches(n: usize) -> Vec<Option<usize>> {
+        (0..n).map(Some).collect()
+    }
+
+    #[test]
+    fn normalize_produces_zero_mean_unit_mean_deviation_points() {
+        let keys = vec![
+            make_kp(100.0, 200.0),
+            make_kp(300.0, 400.0),
+            make_kp(500.0, 100.0),
+            make_kp(200.0, 350.0),
+            make_kp(450.0, 250.0),
+        ];
+
+        let (normed, t) = normalize(&keys);
+
+        assert_eq!(normed.len(), keys.len());
+
+        let n = normed.len() as f32;
+        let mean_x: f32 = normed.iter().map(|p| p.x).sum::<f32>() / n;
+        let mean_y: f32 = normed.iter().map(|p| p.y).sum::<f32>() / n;
+        assert!(mean_x.abs() < 1e-5, "mean_x={}", mean_x);
+        assert!(mean_y.abs() < 1e-5, "mean_y={}", mean_y);
+
+        let mad_x: f32 = normed.iter().map(|p| p.x.abs()).sum::<f32>() / n;
+        let mad_y: f32 = normed.iter().map(|p| p.y.abs()).sum::<f32>() / n;
+        assert!((mad_x - 1.0).abs() < 1e-5);
+        assert!((mad_y - 1.0).abs() < 1e-5);
+
+        for i in 0..keys.len() {
+            let orig = Vector3::new(keys[i].pt().x, keys[i].pt().y, 1.0);
+            let mapped = t * orig;
+            assert!((mapped.x - normed[i].x).abs() < 1e-4);
+            assert!((mapped.y - normed[i].y).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn compute_h21_recovers_known_homography() {
+        let k = make_k(500.0, 500.0, 320.0, 240.0);
+
+        let r_plane =
+            *Rotation3::from_axis_angle(&Vector3::z_axis(), 3.0_f32.to_radians()).matrix();
+        let t_plane = Vector3::new(0.1, 0.05, 0.0);
+        let n = Vector3::new(0.0, 0.0, 1.0);
+        let d = 5.0_f32;
+        let mut h_gt = k * (r_plane - t_plane * n.transpose() / d) * k.try_inverse().unwrap();
+        h_gt /= h_gt[(2, 2)];
+
+        // Fixed, well-spread points
+        let mut pts1 = Vec::with_capacity(8);
+        let mut pts2 = Vec::with_capacity(8);
+        for i in 0..8 {
+            let u1 = 80.0 + i as f32 * 61.0;
+            let v1 = 90.0 + i as f32 * 47.0;
+            let p1h = Vector3::new(u1, v1, 1.0);
+            let p2h: Vector3<f32> = h_gt * p1h;
+            let p2h = p2h / p2h[2];
+            pts1.push(Point2f::new(u1, v1));
+            pts2.push(Point2f::new(p2h[0], p2h[1]));
+        }
+
+        let mut h = compute_h21(&pts1, &pts2);
+        h /= h[(2, 2)];
+
+        for i in 0..8 {
+            let p1 = Vector3::new(pts1[i].x, pts1[i].y, 1.0);
+            let mapped: Vector3<f32> = h * p1;
+            let mapped = mapped / mapped[2];
+            assert!((mapped[0] - pts2[i].x).abs() < 0.5, "i={}", i);
+            assert!((mapped[1] - pts2[i].y).abs() < 0.5, "i={}", i);
+        }
+    }
+
+    #[test]
+    fn compute_f21_produces_rank2_matrix_satisfying_epipolar_constraint() {
+        let k = make_k(500.0, 500.0, 320.0, 240.0);
+
+        let r = *Rotation3::from_axis_angle(&Vector3::y_axis(), 5.0_f32.to_radians()).matrix();
+        let t = Vector3::new(0.3, 0.0, 0.0);
+
+        let mut rng = StdRng::seed_from_u64(99);
+        let i = Matrix3::identity();
+        let z0 = Vector3::zeros();
+
+        let mut raw_keys1 = Vec::new();
+        let mut raw_keys2 = Vec::new();
+        for _ in 0..12 {
+            let pw = Vector3::new(
+                rng.random_range(-1.0..1.0),
+                rng.random_range(-1.0..1.0),
+                rng.random_range(3.0..8.0),
+            );
+            let uv1 = project(&k, &i, &z0, &pw);
+            let uv2 = project(&k, &r, &t, &pw);
+            raw_keys1.push(make_kp(uv1.x, uv1.y));
+            raw_keys2.push(make_kp(uv2.x, uv2.y));
+        }
+
+        let (n_pts1, t1) = normalize(&raw_keys1);
+        let (n_pts2, t2) = normalize(&raw_keys2);
+
+        let f_n = compute_f21(&n_pts1, &n_pts2);
+        let f = t2.transpose() * f_n * t1;
+
+        let svd = SVD::new(f, true, false);
+        let sv = svd.singular_values;
+        assert!(sv[2] / sv[0] < 1e-4, "smallest singular value too large");
+
+        for i in 0..raw_keys1.len() {
+            let x1 = Vector3::new(raw_keys1[i].pt().x, raw_keys1[i].pt().y, 1.0);
+            let x2 = Vector3::new(raw_keys2[i].pt().x, raw_keys2[i].pt().y, 1.0);
+            let val = x2.dot(&(f * x1));
+            assert!(val.abs() < 0.5, "epipolar residual i={} val={}", i, val);
+        }
+    }
+
+    #[test]
+    fn decompose_e_recovers_rotation_and_translation_from_essential_matrix() {
+        let axis = Unit::new_normalize(Vector3::new(0.2, 0.9, 0.1));
+        let r_gt = *Rotation3::from_axis_angle(&axis, 10.0_f32.to_radians()).matrix();
+        let mut t_gt = Vector3::new(0.5, -0.1, 0.2);
+        t_gt.normalize_mut();
+
+        let e = skew_symmetric(&t_gt) * r_gt;
+
+        let (r1, r2, t) = decompose_e(&e);
+
+        let r1_match = (r1 - r_gt).abs().sum() < 1e-2;
+        let r2_match = (r2 - r_gt).abs().sum() < 1e-2;
+        assert!(r1_match || r2_match);
+
+        let t_match = (t - t_gt).norm() < 1e-2 || (t + t_gt).norm() < 1e-2;
+        assert!(t_match);
+    }
+
+    #[test]
+    fn check_homography_scores_perfect_matches_high_and_marks_all_inliers() {
+        let mut h21 = Matrix3::identity();
+        h21[(0, 2)] = 10.0;
+        let h12 = h21.try_inverse().expect("H invertible");
+
+        let n = 20;
+        let mut rng = StdRng::seed_from_u64(55);
+        let mut keys1 = Vec::with_capacity(n);
+        let mut keys2 = Vec::with_capacity(n);
+        let mut matches12 = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let u = rng.random_range(50.0..590.0);
+            let v = rng.random_range(50.0..590.0);
+            keys1.push(make_kp(u, v));
+            let p2: Vector3<f32> = h21 * Vector3::new(u, v, 1.0);
+            keys2.push(make_kp(p2[0] / p2[2], p2[1] / p2[2]));
+            matches12.push((i, i));
+        }
+
+        let (score, inliers) = check_homography(&matches12, &keys1, &keys2, &h21, &h12, 1.0);
+
+        assert!(score > 0.0);
+        assert_eq!(inliers.len(), n);
+        assert!(inliers.iter().all(|&x| x));
+    }
+
+    #[test]
+    fn check_fundamental_scores_perfect_epipolar_matches_high() {
+        let k = make_k(500.0, 500.0, 320.0, 240.0);
+
+        let r = *Rotation3::from_axis_angle(&Vector3::y_axis(), 5.0_f32.to_radians()).matrix();
+        let mut t = Vector3::new(0.3, 0.0, 0.0);
+        t.normalize_mut();
+
+        let k_inv = k.try_inverse().unwrap();
+        let f_gt = k.transpose().try_inverse().unwrap() * skew_symmetric(&t) * r * k_inv;
+
+        let n = 20;
+        let mut rng = StdRng::seed_from_u64(66);
+        let i = Matrix3::identity();
+        let z0 = Vector3::zeros();
+
+        let mut keys1 = Vec::with_capacity(n);
+        let mut keys2 = Vec::with_capacity(n);
+        let mut matches12 = Vec::with_capacity(n);
+
+        for i_idx in 0..n {
+            let pw = Vector3::new(
+                rng.random_range(-1.0..1.0),
+                rng.random_range(-1.0..1.0),
+                rng.random_range(3.0..8.0),
+            );
+            let uv1 = project(&k, &i, &z0, &pw);
+            let uv2 = project(&k, &r, &t, &pw);
+            keys1.push(make_kp(uv1.x, uv1.y));
+            keys2.push(make_kp(uv2.x, uv2.y));
+            matches12.push((i_idx, i_idx));
+        }
+
+        let (score, inliers) = check_fundamental(&matches12, &keys1, &keys2, &f_gt, 1.0);
+
+        assert!(score > 0.0);
+        assert_eq!(inliers.len(), n);
+        assert!(inliers.iter().all(|&x| x));
+    }
+
+    #[test]
+    fn reconstruct_succeeds_on_general_non_planar_scene() {
+        let scene = build_general_scene(400, 42);
+        assert!(scene.keys1.len() >= 50);
+
+        let mut tvr = TwoViewReconstruction::new(scene.k, 1.0, 500);
+        let matches: Vec<Option<usize>> = parallel_matches(scene.keys1.len());
+
+        let Some(result) = tvr.reconstruct(scene.keys1, scene.keys2, &matches) else {
+            panic!("expected reconstruct to succeed");
+        };
+
+        let r_rec = result.t21.rotation.to_rotation_matrix();
+        let t_rec = result.t21.translation.vector.normalize();
+        let t_gt = scene.t / scene.t.norm();
+
+        let r_delta = r_rec * scene.r.transpose();
+        let rot_err =
+            UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(r_delta))
+                .angle()
+                * 180.0
+                / PI;
+        assert!(rot_err < 3.0, "rot_err={}", rot_err);
+
+        let cos_angle = t_rec.dot(&t_gt).abs();
+        assert!(cos_angle > 0.95, "cos_angle={}", cos_angle);
+    }
+
+    #[test]
+    fn reconstruct_succeeds_on_near_planar_scene() {
+        let scene = build_planar_scene(300, 123);
+        assert!(scene.keys1.len() >= 50);
+
+        let mut tvr = TwoViewReconstruction::new(scene.k, 1.0, 500);
+        let matches: Vec<Option<usize>> = parallel_matches(scene.keys1.len());
+
+        let Some(result) = tvr.reconstruct(scene.keys1, scene.keys2, &matches) else {
+            panic!("expected reconstruct to succeed");
+        };
+
+        let r_rec = result.t21.rotation.to_rotation_matrix();
+        let t_rec = result.t21.translation.vector.normalize();
+        let t_gt = scene.t / scene.t.norm();
+
+        let r_delta = r_rec * scene.r.transpose();
+        let rot_err =
+            UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(r_delta))
+                .angle()
+                * 180.0
+                / PI;
+        assert!(rot_err < 8.0, "rot_err={}", rot_err);
+
+        let cos_angle = t_rec.dot(&t_gt).abs();
+        assert!(cos_angle > 0.85, "cos_angle={}", cos_angle);
+    }
+
+    #[test]
+    fn reconstruct_fails_with_collinear_points() {
+        let k = make_k(500.0, 500.0, 320.0, 240.0);
+        let mut tvr = TwoViewReconstruction::new(k, 1.0, 200);
+
+        let mut keys1 = Vec::new();
+        let mut keys2 = Vec::new();
+        for i in 0..20 {
+            let x = 100.0 + i as f32 * 20.0;
+            keys1.push(make_kp(x, 240.0));
+            keys2.push(make_kp(x + 5.0, 240.0));
+        }
+        let matches = parallel_matches(20);
+
+        assert!(tvr.reconstruct(keys1, keys2, &matches).is_none());
+    }
+
+    #[test]
+    fn reconstruct_fails_with_random_outlier_matches() {
+        let k = make_k(500.0, 500.0, 320.0, 240.0);
+        let mut tvr = TwoViewReconstruction::new(k, 1.0, 200);
+
+        let mut rng = StdRng::seed_from_u64(999);
+        let mut keys1 = Vec::new();
+        let mut keys2 = Vec::new();
+        for _ in 0..60 {
+            keys1.push(make_kp(
+                rng.random_range(10.0..630.0),
+                rng.random_range(10.0..630.0),
+            ));
+            keys2.push(make_kp(
+                rng.random_range(10.0..630.0),
+                rng.random_range(10.0..630.0),
+            ));
+        }
+        let matches = parallel_matches(60);
+
+        assert!(tvr.reconstruct(keys1, keys2, &matches).is_none());
+    }
 }

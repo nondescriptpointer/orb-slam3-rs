@@ -1,8 +1,10 @@
-# orb-slam3-rs
+# orb-slam3-rs (WORK IN PROGRESS)
 
-Rust reimplementation of ORB-SLAM3. The original C++ ORB-SLAM3 is currently unmaintained and hard to build on newer systems. This project aims to provide an easier way to run and integrate ORB-SLAM3 into your projects. It follows the general ORB-SLAM3 structure closely while trying to be idiomatic, safe Rust.
+Rust reimplementation of [ORB-SLAM3](https://github.com/UZ-SLAMLab/ORB_SLAM3). The original C++ ORB-SLAM3 is currently unmaintained and hard to build on newer systems. This project aims to provide an easier way to run and integrate ORB-SLAM3 into your projects. It follows the C++ codebase relatively closely while also trying to be idiomatic, safe Rust.
 
-**Authors:** Carlos Campos, Richard Elvira, Juan J. Gómez Rodríguez, [José M. M. Montiel](http://webdiis.unizar.es/~josemari/), [Juan D. Tardos](http://webdiis.unizar.es/~jdtardos/).
+This translation was not vibe coded except for some of the unit tests to validate parity with the C++ codebase.
+
+**Original authors:** Carlos Campos, Richard Elvira, Juan J. Gómez Rodríguez, [José M. M. Montiel](http://webdiis.unizar.es/~josemari/), [Juan D. Tardos](http://webdiis.unizar.es/~jdtardos/).
 
 ### Related Publications:
 
@@ -22,7 +24,9 @@ Rust reimplementation of ORB-SLAM3. The original C++ ORB-SLAM3 is currently unma
 
 # 1. License
 
-ORB-SLAM3 is released under GPLv3 license. For a list of all code/library dependencies (and associated licenses), please see [Dependencies.md](https://github.com/UZ-SLAMLab/ORB_SLAM3/blob/master/Dependencies.md).
+orb-slam3-rs is, like the C++ source, released under GPLv3 license.
+
+For a closed-source version of ORB-SLAM3 for commercial purposes, please contact the original authors: orbslam (at) unizar (dot) es.
 
 If you use ORB-SLAM3 in an academic work, please cite:
 
@@ -38,11 +42,9 @@ If you use ORB-SLAM3 in an academic work, please cite:
       year={2021}
      }
 
-TODO: commercial closed source license not possible.
-
 # 2. Prerequisites
 
-TBD
+Currently only tested on Linux. You just need a recent Rust compiler.
 
 # 3. Building ORB-SLAM3-RS library and examples
 

@@ -23,7 +23,7 @@ fn next_geometric_camera_id() -> u64 {
 // TODO: review if all this mix of datatypes is needed like this
 // might be better to keep a more consistent formatting
 // TODO: serialize
-trait GeometricCamera {
+pub trait GeometricCamera {
     fn new() -> Self
     where
         Self: Sized;
@@ -31,6 +31,7 @@ trait GeometricCamera {
     where
         Self: Sized;
     fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 
     fn project(&self, p3d: &Point3f) -> Point2f;
     fn project_n(&self, p3d: &Point3<f32>) -> Point2<f32>;
@@ -83,4 +84,15 @@ trait GeometricCamera {
 
     fn get_id(&self) -> u64;
     fn get_type(&self) -> Type;
+}
+
+impl std::fmt::Debug for dyn GeometricCamera {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "Geometric Camera {} {:?}",
+            self.get_id(),
+            self.get_type(),
+        )
+    }
 }

@@ -3,7 +3,7 @@ use tracing::info;
 
 use crate::settings::{Settings, SettingsError};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sensor {
     Monocular = 0,
     Stereo = 1,

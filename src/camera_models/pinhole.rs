@@ -4,7 +4,8 @@ use crate::two_view_reconstruction::{ReconstructResult, TwoViewReconstruction};
 use nalgebra::{Matrix2x3, Matrix3, Point2, Point3, Vector3};
 use opencv::core::{KeyPointTraitConst, Mat, Point2f, Point3f};
 
-struct Pinhole {
+#[derive(Clone)]
+pub struct Pinhole {
     parameters: Vec<f32>,
     id: u64,
     camera_type: Type,
@@ -38,6 +39,9 @@ impl GeometricCamera for Pinhole {
         }
     }
     fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
 

@@ -13,14 +13,14 @@ use crate::{
     camera_models::{GeometricCamera, Type, next_geometric_camera_id},
     two_view_reconstruction::{ReconstructResult, TwoViewReconstruction},
 };
-
-struct KannalaBrandt8 {
+#[derive(Clone)]
+pub struct KannalaBrandt8 {
     parameters: Vec<f32>,
     id: u64,
     camera_type: Type,
     tvr: Option<TwoViewReconstruction>,
     precision: f32,
-    lapping_area: Vec<usize>,
+    pub lapping_area: Vec<usize>,
 }
 
 struct TriangulateMatchesResult {
@@ -248,6 +248,9 @@ impl GeometricCamera for KannalaBrandt8 {
         }
     }
     fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
 

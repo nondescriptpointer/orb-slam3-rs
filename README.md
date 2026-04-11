@@ -1,6 +1,6 @@
 # orb-slam3-rs (WORK IN PROGRESS)
 
-Rust reimplementation of [ORB-SLAM3](https://github.com/UZ-SLAMLab/ORB_SLAM3). The original C++ ORB-SLAM3 is currently unmaintained and hard to build on newer systems. This project aims to provide an easier way to run and integrate ORB-SLAM3 into your projects. It follows the C++ codebase relatively closely while also trying to be idiomatic, safe Rust.
+Rust reimplementation of [ORB-SLAM3](https://github.com/UZ-SLAMLab/ORB_SLAM3). The original C++ ORB-SLAM3 is currently unmaintained and hard to build on newer systems while still being the most used reference for realtime SLAM. This project aims to provide an easier way to run and integrate ORB-SLAM3 into your projects. It follows the C++ codebase relatively closely while also trying to be idiomatic, safe Rust.
 
 This translation was not vibe coded except for some of the unit tests to validate parity with the C++ codebase.
 

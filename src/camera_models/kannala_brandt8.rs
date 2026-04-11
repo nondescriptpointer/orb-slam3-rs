@@ -27,6 +27,7 @@ struct TriangulateMatchesResult {
     z1: f32,
     p3d: Vector3<f32>,
 }
+#[derive(Debug)]
 enum TriangulateMatchesError {
     Parallax,    // -1
     Z1,          // -2
@@ -579,5 +580,329 @@ impl GeometricCamera for KannalaBrandt8 {
 
     fn get_type(&self) -> Type {
         self.camera_type
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nalgebra::{Matrix2x1, Rotation3};
+    use opencv::prelude::*;
+
+    const FX: f32 = 190.0;
+    const FY: f32 = 190.0;
+    const CX: f32 = 254.0;
+    const CY: f32 = 256.0;
+    const K0: f32 = 0.003;
+    const K1: f32 = 0.001;
+    const K2: f32 = -0.002;
+    const K3: f32 = 0.0002;
+
+    const PARAMS: [f32; 8] = [FX, FY, CX, CY, K0, K1, K2, K3];
+
+    fn make_cam() -> KannalaBrandt8 {
+        KannalaBrandt8::with_params(PARAMS.to_vec())
+    }
+
+    fn make_kp(x: f32, y: f32) -> KeyPoint {
+        KeyPoint::new_point_def(Point2f::new(x, y), 1.0).unwrap()
+    }
+
+    fn distort_theta(theta: f32) -> f32 {
+        let t2 = theta * theta;
+        theta
+            + K0 * t2 * theta
+            + K1 * t2 * t2 * theta
+            + K2 * t2 * t2 * t2 * theta
+            + K3 * t2 * t2 * t2 * t2 * theta
+    }
+
+    fn project_f64(v: &Point3<f64>) -> Point2<f64> {
+        let x2y2 = v[0] * v[0] + v[1] * v[1];
+        let theta = x2y2.sqrt().atan2(v[2]);
+        let psi = v[1].atan2(v[0]);
+        let t2 = theta * theta;
+        let r = theta
+            + K0 as f64 * t2 * theta
+            + K1 as f64 * t2 * t2 * theta
+            + K2 as f64 * t2 * t2 * t2 * theta
+            + K3 as f64 * t2 * t2 * t2 * t2 * theta;
+        Point2::new(
+            FX as f64 * r * psi.cos() + CX as f64,
+            FY as f64 * r * psi.sin() + CY as f64,
+        )
+    }
+
+    fn assert_approx(a: f32, b: f32, eps: f32) {
+        assert!(
+            (a - b).abs() < eps,
+            "expected {b}, got {a} (diff={}, eps={eps})",
+            (a - b).abs()
+        );
+    }
+
+    fn assert_approx64(a: f64, b: f64, eps: f64) {
+        assert!(
+            (a - b).abs() < eps,
+            "expected {b}, got {a} (diff={}, eps={eps})",
+            (a - b).abs()
+        );
+    }
+
+    #[test]
+    fn to_k_returns_correct_intrinsic_matrix() {
+        let cam = make_cam();
+        let k = cam.to_k();
+        assert_approx(*k.at_2d::<f32>(0, 0).unwrap(), FX, 1e-6);
+        assert_approx(*k.at_2d::<f32>(1, 1).unwrap(), FY, 1e-6);
+        assert_approx(*k.at_2d::<f32>(0, 2).unwrap(), CX, 1e-6);
+        assert_approx(*k.at_2d::<f32>(1, 2).unwrap(), CY, 1e-6);
+        assert_approx(*k.at_2d::<f32>(2, 2).unwrap(), 1.0, 1e-6);
+        assert_approx(*k.at_2d::<f32>(0, 1).unwrap(), 0.0, 1e-6);
+        assert_approx(*k.at_2d::<f32>(1, 0).unwrap(), 0.0, 1e-6);
+        assert_approx(*k.at_2d::<f32>(2, 0).unwrap(), 0.0, 1e-6);
+        assert_approx(*k.at_2d::<f32>(2, 1).unwrap(), 0.0, 1e-6);
+    }
+
+    #[test]
+    fn to_k_n_returns_correct_intrinsic_matrix() {
+        let cam = make_cam();
+        let k = cam.to_k_n();
+        assert_approx(k[(0, 0)], FX, 1e-6);
+        assert_approx(k[(1, 1)], FY, 1e-6);
+        assert_approx(k[(0, 2)], CX, 1e-6);
+        assert_approx(k[(1, 2)], CY, 1e-6);
+        assert_approx(k[(2, 2)], 1.0, 1e-6);
+        assert_approx(k[(0, 1)], 0.0, 1e-6);
+        assert_approx(k[(1, 0)], 0.0, 1e-6);
+    }
+
+    #[test]
+    fn project_point3f() {
+        let cam = make_cam();
+        let p = Point3f::new(1.0, 2.0, 5.0);
+        let theta = (1.0_f32 + 4.0).sqrt().atan2(5.0);
+        let psi = 2.0_f32.atan2(1.0);
+        let r = distort_theta(theta);
+        let uv = cam.project(&p);
+        assert_approx(uv.x, FX * r * psi.cos() + CX, 1e-5);
+        assert_approx(uv.y, FY * r * psi.sin() + CY, 1e-5);
+    }
+
+    #[test]
+    fn project_n_d_point3_f64() {
+        let cam = make_cam();
+        let p = Point3::new(1.0_f64, 2.0, 5.0);
+        let theta = (1.0_f32 + 4.0).sqrt().atan2(5.0);
+        let psi = 2.0_f32.atan2(1.0);
+        let r = distort_theta(theta);
+        let uv = cam.project_n_d(&p);
+        assert_approx64(uv[0], (FX * r * psi.cos() + CX) as f64, 1e-4);
+        assert_approx64(uv[1], (FY * r * psi.sin() + CY) as f64, 1e-4);
+    }
+
+    #[test]
+    fn project_n_point3_f32() {
+        let cam = make_cam();
+        let p = Point3::new(1.0_f32, 2.0, 5.0);
+        let theta = (1.0_f32 + 4.0).sqrt().atan2(5.0);
+        let psi = 2.0_f32.atan2(1.0);
+        let r = distort_theta(theta);
+        let uv = cam.project_n(&p);
+        assert_approx(uv[0], FX * r * psi.cos() + CX, 1e-5);
+        assert_approx(uv[1], FY * r * psi.sin() + CY, 1e-5);
+    }
+
+    #[test]
+    fn project_mat_matches_project() {
+        let cam = make_cam();
+        let p = Point3f::new(3.0, -1.0, 4.0);
+        let uv_cv = cam.project(&p);
+        let uv_n = cam.project_mat(&p);
+        assert_approx(uv_n[0], uv_cv.x, 1e-6);
+        assert_approx(uv_n[1], uv_cv.y, 1e-6);
+    }
+
+    #[test]
+    fn project_at_principal_point() {
+        let cam = make_cam();
+        let p = Point3f::new(0.0, 0.0, 1.0);
+        let uv = cam.project(&p);
+        assert_approx(uv.x, CX, 1e-5);
+        assert_approx(uv.y, CY, 1e-5);
+    }
+
+    #[test]
+    fn all_project_overloads_agree() {
+        let cam = make_cam();
+        let pcv = Point3f::new(2.0, -1.5, 3.0);
+        let pd = Point3::new(2.0_f64, -1.5, 3.0);
+        let pf = Point3::new(2.0_f32, -1.5, 3.0);
+
+        let uv_cv = cam.project(&pcv);
+        let uv_d = cam.project_n_d(&pd);
+        let uv_f = cam.project_n(&pf);
+        let uv_m = cam.project_mat(&pcv);
+
+        assert_approx64(uv_d[0], uv_cv.x as f64, 1e-4);
+        assert_approx64(uv_d[1], uv_cv.y as f64, 1e-4);
+        assert_approx(uv_f[0], uv_cv.x, 1e-5);
+        assert_approx(uv_f[1], uv_cv.y, 1e-5);
+        assert_approx(uv_m[0], uv_cv.x, 1e-5);
+        assert_approx(uv_m[1], uv_cv.y, 1e-5);
+    }
+
+    #[test]
+    fn unproject_inverts_project_small_angle() {
+        let cam = make_cam();
+        let pw = Point3f::new(0.3, -0.2, 1.0);
+        let uv = cam.project(&pw);
+        let ray = cam.unproject(&uv);
+        let expected_norm = (pw.x * pw.x + pw.y * pw.y).sqrt();
+        let actual_norm = (ray.x * ray.x + ray.y * ray.y).sqrt();
+        if expected_norm > 1e-6 {
+            assert_approx(ray.x / actual_norm, pw.x / expected_norm, 1e-3);
+            assert_approx(ray.y / actual_norm, pw.y / expected_norm, 1e-3);
+        }
+        assert_approx(ray.z, 1.0, 1e-6);
+    }
+
+    #[test]
+    fn unproject_n_agrees_with_unproject() {
+        let cam = make_cam();
+        let uv = Point2f::new(200.0, 300.0);
+        let ray_cv = cam.unproject(&uv);
+        let ray_n = cam.unproject_n(&uv);
+        assert_approx(ray_n[0], ray_cv.x, 1e-6);
+        assert_approx(ray_n[1], ray_cv.y, 1e-6);
+        assert_approx(ray_n[2], ray_cv.z, 1e-6);
+    }
+
+    #[test]
+    fn unproject_principal_point_yields_zero_bearing() {
+        let cam = make_cam();
+        let ray = cam.unproject(&Point2f::new(CX, CY));
+        assert_approx(ray.x, 0.0, 1e-6);
+        assert_approx(ray.y, 0.0, 1e-6);
+        assert_approx(ray.z, 1.0, 1e-6);
+    }
+
+    #[test]
+    fn project_unproject_preserves_bearing_direction() {
+        let cam = make_cam();
+        for i in 0..50 {
+            let x = -0.5 + i as f32 * 0.02;
+            let y = -0.3 + i as f32 * 0.015;
+            let pw = Point3f::new(x, y, 1.0);
+            let uv = cam.project(&pw);
+            let ray = cam.unproject(&uv);
+
+            let norm_pw = (pw.x * pw.x + pw.y * pw.y).sqrt();
+            let norm_ray = (ray.x * ray.x + ray.y * ray.y).sqrt();
+            if norm_pw > 1e-6 {
+                assert_approx(ray.x / norm_ray, pw.x / norm_pw, 1e-3);
+                assert_approx(ray.y / norm_ray, pw.y / norm_pw, 1e-3);
+            }
+        }
+    }
+
+    #[test]
+    fn project_jac_matches_finite_difference() {
+        let cam = make_cam();
+        let p = Point3::new(1.5_f64, -0.8, 4.0);
+        let j = cam.project_jac(&p);
+        let eps = 1e-7_f64;
+        for col in 0..3 {
+            let mut pp = p;
+            let mut pm = p;
+            pp[col] += eps;
+            pm[col] -= eps;
+            let dp = (project_f64(&pp) - project_f64(&pm)) / (2.0 * eps);
+            assert_approx64(j[(0, col)], dp[0], 1e-4);
+            assert_approx64(j[(1, col)], dp[1], 1e-4);
+        }
+    }
+
+    #[test]
+    fn project_jac_at_multiple_points() {
+        let cam = make_cam();
+        let pts = [
+            Point3::new(0.5_f64, 0.5, 3.0),
+            Point3::new(-1.0, 2.0, 5.0),
+            Point3::new(0.1, -0.1, 1.0),
+            Point3::new(2.0, 0.0, 4.0),
+        ];
+        let eps = 1e-7_f64;
+        for p in &pts {
+            let j = cam.project_jac(p);
+            for col in 0..3 {
+                let mut pp = *p;
+                let mut pm = *p;
+                pp[col] += eps;
+                pm[col] -= eps;
+                let dp = (project_f64(&pp) - project_f64(&pm)) / (2.0 * eps);
+                assert_approx64(j[(0, col)], dp[0], 1e-4);
+                assert_approx64(j[(1, col)], dp[1], 1e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn triangulate_matches_succeeds_for_correct_stereo_pair() {
+        let cam1 = make_cam();
+        let cam2 = make_cam();
+
+        let r12 = *Rotation3::from_axis_angle(&Vector3::y_axis(), 10.0_f32.to_radians()).matrix();
+        let t12 = Vector3::new(0.5_f32, 0.0, 0.0);
+        let r21 = r12.transpose();
+
+        let pw = Vector3::new(0.3_f32, -0.1, 3.0);
+        let pc2 = r21 * (pw - t12);
+
+        let uv1 = cam1.project(&Point3f::new(pw[0], pw[1], pw[2]));
+        let uv2 = cam2.project(&Point3f::new(pc2[0], pc2[1], pc2[2]));
+
+        let kp1 = make_kp(uv1.x, uv1.y);
+        let kp2 = make_kp(uv2.x, uv2.y);
+
+        let result = cam1.triangulate_matches(&cam2, &kp1, &kp2, &r12, &t12, 5.0, 5.0);
+        assert!(result.is_ok());
+        assert!(result.unwrap().z1 > 0.0);
+    }
+
+    #[test]
+    fn epipolar_constrain_accepts_correct_match() {
+        let cam1 = make_cam();
+        let cam2 = make_cam();
+
+        let r12 = *Rotation3::from_axis_angle(&Vector3::y_axis(), 10.0_f32.to_radians()).matrix();
+        let t12 = Point3::new(0.5_f32, 0.0, 0.0);
+        let t12_v = Vector3::new(0.5_f32, 0.0, 0.0);
+        let r21 = r12.transpose();
+
+        let pw = Vector3::new(0.3_f32, -0.1, 3.0);
+        let pc2 = r21 * (pw - t12_v);
+
+        let uv1 = cam1.project(&Point3f::new(pw[0], pw[1], pw[2]));
+        let uv2 = cam2.project(&Point3f::new(pc2[0], pc2[1], pc2[2]));
+
+        let kp1 = make_kp(uv1.x, uv1.y);
+        let kp2 = make_kp(uv2.x, uv2.y);
+
+        assert!(cam1.epipolar_constrain(&cam2, &kp1, &kp2, &r12, &t12, 5.0, 5.0));
+    }
+
+    #[test]
+    fn epipolar_constrain_rejects_far_off_point() {
+        let cam1 = make_cam();
+        let cam2 = make_cam();
+
+        let r12 = *Rotation3::from_axis_angle(&Vector3::y_axis(), 5.0_f32.to_radians()).matrix();
+        let t12 = Point3::new(0.3_f32, 0.0, 0.0);
+
+        let kp1 = make_kp(100.0, 100.0);
+        let kp2 = make_kp(500.0, 400.0);
+
+        assert!(!cam1.epipolar_constrain(&cam2, &kp1, &kp2, &r12, &t12, 1.0, 1.0));
     }
 }

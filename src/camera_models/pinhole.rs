@@ -1,7 +1,7 @@
 use crate::camera_models::{GeometricCamera, Type, next_geometric_camera_id};
 use crate::two_view_reconstruction::{ReconstructResult, TwoViewReconstruction};
 
-use nalgebra::{Matrix2x3, Matrix3, Point2, Point3};
+use nalgebra::{Matrix2x3, Matrix3, Point2, Point3, Vector3};
 use opencv::core::{KeyPointTraitConst, Mat, Point2f, Point3f};
 
 struct Pinhole {
@@ -23,7 +23,7 @@ impl GeometricCamera for Pinhole {
             tvr: None,
         }
     }
-    fn from_params(params: Vec<f32>) -> Self
+    fn with_params(params: Vec<f32>) -> Self
     where
         Self: Sized,
     {
@@ -75,8 +75,8 @@ impl GeometricCamera for Pinhole {
             1.,
         )
     }
-    fn unproject_n(&self, p2d: &Point2f) -> Point3<f32> {
-        Point3::new(
+    fn unproject_n(&self, p2d: &Point2f) -> Vector3<f32> {
+        Vector3::new(
             (p2d.x - self.parameters[2]) / self.parameters[0],
             (p2d.y - self.parameters[3]) / self.parameters[1],
             1.,
@@ -99,11 +99,10 @@ impl GeometricCamera for Pinhole {
         keys1: &Vec<opencv::core::KeyPoint>,
         keys2: &Vec<opencv::core::KeyPoint>,
         matches: &Vec<Option<usize>>,
-        p3d: &Vec<Point3f>,
     ) -> Option<ReconstructResult> {
         if self.tvr.is_none() {
             let k = self.to_k_n();
-            self.tvr = Some(TwoViewReconstruction::from_k(k));
+            self.tvr = Some(TwoViewReconstruction::new(k));
         }
         if let Some(tvr) = &mut self.tvr {
             tvr.reconstruct(&keys1, &keys2, matches)
@@ -183,9 +182,8 @@ impl GeometricCamera for Pinhole {
         _tcw2: &nalgebra::Isometry3<f32>,
         _sigma_level1: f32,
         _sigma_level2: f32,
-        _triangulated_3d: &nalgebra::Vector3<f32>,
-    ) -> bool {
-        false
+    ) -> Option<Vector3<f32>> {
+        None
     }
 
     fn get_id(&self) -> u64 {
@@ -222,5 +220,214 @@ impl Pinhole {
             }
         }
         is_same
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nalgebra::{Rotation3, Vector3};
+    use opencv::core::KeyPoint;
+    use opencv::prelude::*;
+
+    const FX: f32 = 517.3;
+    const FY: f32 = 516.5;
+    const CX: f32 = 318.6;
+    const CY: f32 = 255.3;
+
+    fn make_cam() -> Pinhole {
+        Pinhole::with_params(vec![FX, FY, CX, CY])
+    }
+
+    fn make_kp(x: f32, y: f32) -> KeyPoint {
+        KeyPoint::new_point_def(Point2f::new(x, y), 1.0).unwrap()
+    }
+
+    fn assert_approx(a: f32, b: f32, eps: f32) {
+        assert!(
+            (a - b).abs() < eps,
+            "expected {b}, got {a} (diff={}, eps={eps})",
+            (a - b).abs()
+        );
+    }
+
+    fn assert_approx64(a: f64, b: f64, eps: f64) {
+        assert!(
+            (a - b).abs() < eps,
+            "expected {b}, got {a} (diff={}, eps={eps})",
+            (a - b).abs()
+        );
+    }
+
+    #[test]
+    fn to_k_returns_correct_intrinsic_matrix() {
+        let cam = make_cam();
+        let k = cam.to_k();
+        assert_approx(*k.at_2d::<f32>(0, 0).unwrap(), FX, 1e-6);
+        assert_approx(*k.at_2d::<f32>(1, 1).unwrap(), FY, 1e-6);
+        assert_approx(*k.at_2d::<f32>(0, 2).unwrap(), CX, 1e-6);
+        assert_approx(*k.at_2d::<f32>(1, 2).unwrap(), CY, 1e-6);
+        assert_approx(*k.at_2d::<f32>(2, 2).unwrap(), 1.0, 1e-6);
+        assert_approx(*k.at_2d::<f32>(0, 1).unwrap(), 0.0, 1e-6);
+        assert_approx(*k.at_2d::<f32>(1, 0).unwrap(), 0.0, 1e-6);
+        assert_approx(*k.at_2d::<f32>(2, 0).unwrap(), 0.0, 1e-6);
+        assert_approx(*k.at_2d::<f32>(2, 1).unwrap(), 0.0, 1e-6);
+    }
+
+    #[test]
+    fn to_k_n_returns_correct_intrinsic_matrix() {
+        let cam = make_cam();
+        let k = cam.to_k_n();
+        assert_approx(k[(0, 0)], FX, 1e-6);
+        assert_approx(k[(1, 1)], FY, 1e-6);
+        assert_approx(k[(0, 2)], CX, 1e-6);
+        assert_approx(k[(1, 2)], CY, 1e-6);
+        assert_approx(k[(2, 2)], 1.0, 1e-6);
+        assert_approx(k[(0, 1)], 0.0, 1e-6);
+        assert_approx(k[(1, 0)], 0.0, 1e-6);
+    }
+
+    #[test]
+    fn project_point3f() {
+        let cam = make_cam();
+        let p = Point3f::new(1.0, 2.0, 5.0);
+        let uv = cam.project(&p);
+        assert_approx(uv.x, FX * 1.0 / 5.0 + CX, 1e-4);
+        assert_approx(uv.y, FY * 2.0 / 5.0 + CY, 1e-4);
+    }
+
+    #[test]
+    fn project_n_d_point3_f64() {
+        let cam = make_cam();
+        let p = Point3::new(1.0_f64, 2.0, 5.0);
+        let uv = cam.project_n_d(&p);
+        assert_approx64(uv[0], FX as f64 * 1.0 / 5.0 + CX as f64, 1e-4);
+        assert_approx64(uv[1], FY as f64 * 2.0 / 5.0 + CY as f64, 1e-4);
+    }
+
+    #[test]
+    fn project_n_point3_f32() {
+        let cam = make_cam();
+        let p = Point3::new(1.0_f32, 2.0, 5.0);
+        let uv = cam.project_n(&p);
+        assert_approx(uv[0], FX * 1.0 / 5.0 + CX, 1e-4);
+        assert_approx(uv[1], FY * 2.0 / 5.0 + CY, 1e-4);
+    }
+
+    #[test]
+    fn project_mat_matches_project() {
+        let cam = make_cam();
+        let p = Point3f::new(3.0, -1.0, 4.0);
+        let uv_cv = cam.project(&p);
+        let uv_n = cam.project_mat(&p);
+        assert_approx(uv_n[0], uv_cv.x, 1e-6);
+        assert_approx(uv_n[1], uv_cv.y, 1e-6);
+    }
+
+    #[test]
+    fn project_at_principal_point() {
+        let cam = make_cam();
+        let p = Point3f::new(0.0, 0.0, 1.0);
+        let uv = cam.project(&p);
+        assert_approx(uv.x, CX, 1e-6);
+        assert_approx(uv.y, CY, 1e-6);
+    }
+
+    #[test]
+    fn unproject_inverts_project() {
+        let cam = make_cam();
+        let pw = Point3f::new(0.7, -0.3, 1.0);
+        let uv = cam.project(&pw);
+        let ray = cam.unproject(&uv);
+        assert_approx(ray.x, pw.x, 1e-5);
+        assert_approx(ray.y, pw.y, 1e-5);
+        assert_approx(ray.z, 1.0, 1e-6);
+    }
+
+    #[test]
+    fn unproject_n_computes_correct_ray() {
+        let cam = make_cam();
+        let uv = Point2f::new(200.0, 300.0);
+        let ray = cam.unproject_n(&uv);
+        assert_approx(ray[0], (200.0 - CX) / FX, 1e-5);
+        assert_approx(ray[1], (300.0 - CY) / FY, 1e-5);
+        assert_approx(ray[2], 1.0, 1e-6);
+    }
+
+    #[test]
+    fn unproject_principal_point_yields_zero_bearing() {
+        let cam = make_cam();
+        let ray = cam.unproject(&Point2f::new(CX, CY));
+        assert_approx(ray.x, 0.0, 1e-6);
+        assert_approx(ray.y, 0.0, 1e-6);
+        assert_approx(ray.z, 1.0, 1e-6);
+    }
+
+    #[test]
+    fn project_unproject_round_trip() {
+        let cam = make_cam();
+        for i in 0..50 {
+            let x = -2.0 + i as f32 * 0.1;
+            let y = -1.0 + i as f32 * 0.05;
+            let pw = Point3f::new(x, y, 1.0);
+            let uv = cam.project(&pw);
+            let ray = cam.unproject(&uv);
+            assert_approx(ray.x, pw.x, 1e-4);
+            assert_approx(ray.y, pw.y, 1e-4);
+        }
+    }
+
+    #[test]
+    fn project_jac_matches_finite_difference() {
+        let cam = make_cam();
+        let p = Point3::new(1.5_f64, -0.8, 4.0);
+        let j = cam.project_jac(&p);
+        let eps = 1e-6_f64;
+        for col in 0..3 {
+            let mut pp = p;
+            let mut pm = p;
+            pp[col] += eps;
+            pm[col] -= eps;
+            let dp = (cam.project_n_d(&pp) - cam.project_n_d(&pm)) / (2.0 * eps);
+            assert_approx64(j[(0, col)], dp[0], 1e-4);
+            assert_approx64(j[(1, col)], dp[1], 1e-4);
+        }
+    }
+
+    #[test]
+    fn epipolar_constrain_accepts_perfect_match() {
+        let cam1 = make_cam();
+        let cam2 = make_cam();
+
+        let r12 = *Rotation3::from_axis_angle(&Vector3::y_axis(), 5.0_f32.to_radians()).matrix();
+        let t12 = Point3::new(0.3_f32, 0.0, 0.0);
+        let k = cam1.to_k_n();
+
+        let pw = Vector3::new(0.5_f32, -0.2, 5.0);
+        let pc2 = r12 * pw + t12.coords;
+
+        let mut uv1h = k * pw;
+        uv1h /= uv1h[2];
+        let mut uv2h = k * pc2;
+        uv2h /= uv2h[2];
+
+        let kp1 = make_kp(uv1h[0], uv1h[1]);
+        let kp2 = make_kp(uv2h[0], uv2h[1]);
+
+        assert!(cam1.epipolar_constrain(&cam2, &kp1, &kp2, &r12, &t12, 1.0, 1.0));
+    }
+
+    #[test]
+    fn epipolar_constrain_rejects_far_off_point() {
+        let cam1 = make_cam();
+        let cam2 = make_cam();
+
+        let r12 = *Rotation3::from_axis_angle(&Vector3::y_axis(), 5.0_f32.to_radians()).matrix();
+        let t12 = Point3::new(0.3_f32, 0.0, 0.0);
+
+        let kp1 = make_kp(100.0, 100.0);
+        let kp2 = make_kp(500.0, 400.0);
+
+        assert!(!cam1.epipolar_constrain(&cam2, &kp1, &kp2, &r12, &t12, 1.0, 1.0));
     }
 }

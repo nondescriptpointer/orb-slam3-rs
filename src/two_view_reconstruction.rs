@@ -43,21 +43,7 @@ pub struct ReconstructResult {
 }
 
 impl TwoViewReconstruction {
-    fn new(k: Matrix3<f32>, sigma: f32, iterations: u32) -> Self {
-        TwoViewReconstruction {
-            keys1: Vec::new(),
-            keys2: Vec::new(),
-            matches12: Vec::new(),
-            matched1: Vec::new(),
-            k: k,
-            sigma: sigma,
-            sigma2: sigma * sigma,
-            max_iterations: iterations,
-            sets: Vec::new(),
-        }
-    }
-
-    pub fn from_k(k: Matrix3<f32>) -> Self {
+    pub fn new(k: Matrix3<f32>) -> Self {
         let sigma = 1.0;
         let iterations = 200;
         TwoViewReconstruction {
@@ -1220,7 +1206,7 @@ mod tests {
         let scene = build_general_scene(400, 42);
         assert!(scene.keys1.len() >= 50);
 
-        let mut tvr = TwoViewReconstruction::new(scene.k, 1.0, 500);
+        let mut tvr = TwoViewReconstruction::new(scene.k);
         let matches: Vec<Option<usize>> = parallel_matches(scene.keys1.len());
 
         let Some(result) = tvr.reconstruct(&scene.keys1, &scene.keys2, &matches) else {
@@ -1248,7 +1234,7 @@ mod tests {
         let scene = build_planar_scene(300, 123);
         assert!(scene.keys1.len() >= 50);
 
-        let mut tvr = TwoViewReconstruction::new(scene.k, 1.0, 500);
+        let mut tvr = TwoViewReconstruction::new(scene.k);
         let matches: Vec<Option<usize>> = parallel_matches(scene.keys1.len());
 
         let Some(result) = tvr.reconstruct(&scene.keys1, &scene.keys2, &matches) else {
@@ -1274,7 +1260,7 @@ mod tests {
     #[test]
     fn reconstruct_fails_with_collinear_points() {
         let k = make_k(500.0, 500.0, 320.0, 240.0);
-        let mut tvr = TwoViewReconstruction::new(k, 1.0, 200);
+        let mut tvr = TwoViewReconstruction::new(k);
 
         let mut keys1 = Vec::new();
         let mut keys2 = Vec::new();
@@ -1291,7 +1277,7 @@ mod tests {
     #[test]
     fn reconstruct_fails_with_random_outlier_matches() {
         let k = make_k(500.0, 500.0, 320.0, 240.0);
-        let mut tvr = TwoViewReconstruction::new(k, 1.0, 200);
+        let mut tvr = TwoViewReconstruction::new(k);
 
         let mut rng = StdRng::seed_from_u64(999);
         let mut keys1 = Vec::new();

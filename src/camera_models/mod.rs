@@ -27,7 +27,7 @@ trait GeometricCamera {
     fn new() -> Self
     where
         Self: Sized;
-    fn from_params(params: Vec<f32>) -> Self
+    fn with_params(params: Vec<f32>) -> Self
     where
         Self: Sized;
     fn as_any(&self) -> &dyn Any;
@@ -39,7 +39,7 @@ trait GeometricCamera {
 
     fn uncertainty(&self, p2d: &Matrix2x1<f64>) -> f32;
 
-    fn unproject_n(&self, p2d: &Point2f) -> Point3<f32>;
+    fn unproject_n(&self, p2d: &Point2f) -> Vector3<f32>;
     fn unproject(&self, p2d: &Point2f) -> Point3f;
 
     fn project_jac(&self, p3d: &Point3<f64>) -> Matrix2x3<f64>;
@@ -49,7 +49,6 @@ trait GeometricCamera {
         keys1: &Vec<KeyPoint>,
         keys2: &Vec<KeyPoint>,
         matches: &Vec<Option<usize>>,
-        p3d: &Vec<Point3f>,
     ) -> Option<ReconstructResult>;
 
     fn to_k(&self) -> Mat;
@@ -80,8 +79,7 @@ trait GeometricCamera {
         tcw2: &Isometry3<f32>,
         sigma_level1: f32,
         sigma_level2: f32,
-        triangulated_3d: &Vector3<f32>,
-    ) -> bool;
+    ) -> Option<Vector3<f32>>;
 
     fn get_id(&self) -> u64;
     fn get_type(&self) -> Type;

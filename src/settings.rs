@@ -4,7 +4,8 @@ use crate::{
 };
 use nalgebra::{Isometry3, Matrix3, Rotation3, Translation3, UnitQuaternion};
 use opencv::{
-    core::{FileStorage, FileStorage_READ, Mat, Size},
+    calib3d::{CALIB_ZERO_DISPARITY, init_undistort_rectify_map, stereo_rectify},
+    core::{CV_32F, CV_64F, FileStorage, FileStorage_READ, Mat, Rect, Size},
     prelude::*,
 };
 use std::path::PathBuf;
@@ -52,17 +53,78 @@ struct RGBDInfo {
     bf: f32,
 }
 
+struct StereoInfo {
+    tlr: Isometry3<f32>,
+    b: f32,
+    bf: f32,
+    m1l: Mat,
+    m2l: Mat,
+    m1r: Mat,
+    m2r: Mat,
+}
+
+// Mat does not implement Debug, so we hand-roll it.
+impl std::fmt::Debug for StereoInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StereoInfo")
+            .field("tlr", &self.tlr)
+            .field("b", &self.b)
+            .field("bf", &self.bf)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+struct ORBInfo {
+    n_features: i32,
+    scale_factor: f32,
+    n_levels: i32,
+    init_th_fast: i32,
+    min_th_fast: i32,
+}
+
+#[derive(Debug)]
+struct ViewerInfo {
+    keyframe_size: f32,
+    keyframe_linewidth: f32,
+    graph_linewidth: f32,
+    point_size: f32,
+    camera_size: f32,
+    camera_linewidth: f32,
+    view_point_x: f32,
+    view_point_y: f32,
+    view_point_z: f32,
+    view_point_f: f32,
+    image_viewer_scale: f32,
+}
+
+#[derive(Debug)]
+struct LoadAndSaveInfo {
+    load_from: Option<String>,
+    save_to: Option<String>,
+}
+
+#[derive(Debug)]
+struct OtherInfo {
+    th_far_points: Option<f32>,
+}
+
 #[derive(Debug)]
 pub struct Settings {
     sensor: Sensor,
     camera_model: CameraType,
     camera1: Option<CameraInfo>,
     camera2: Option<CameraInfo>,
+    need_to_rectify: bool,
+    need_to_undistort: bool,
     image: ImageInfo,
     imu: Option<IMUInfo>,
     rgbd: Option<RGBDInfo>,
-    need_to_rectify: bool,
-    need_to_undistort: bool,
+    stereo: Option<StereoInfo>,
+    orb: ORBInfo,
+    viewer: ViewerInfo,
+    load_and_save: LoadAndSaveInfo,
+    other: OtherInfo,
 }
 
 #[derive(Debug)]
@@ -72,6 +134,7 @@ pub enum SettingsError {
     InvalidDatatype(String),
     MissingCameraModel,
     InvalidCameraModel(String),
+    Rectification,
 }
 
 impl Settings {
@@ -137,7 +200,7 @@ impl Settings {
         );
 
         // IMU info
-        let imu = if matches!(
+        let mut imu = if matches!(
             sensor,
             Sensor::IMUMonocular | Sensor::IMUStereo | Sensor::IMURGBD
         ) {
@@ -160,12 +223,193 @@ impl Settings {
             None
         };
 
-        // TODO
-        // ORB
-        // Viewer
-        // Load and save
-        // Other params
+        // Other info
+        let orb = Self::read_orb(&settings);
+        let viewer = Self::read_viewer(&settings);
+        let load_and_save = Self::read_load_and_save(&settings);
+        let other = Self::read_other(&settings);
 
+        // Precompute rectification maps
+        let mut stereo = None;
+        if need_to_rectify {
+            let k1 = camera1.as_ref().unwrap().calibration.to_k();
+            let mut k1_converted = Mat::default();
+            k1.convert_to(&mut k1_converted, CV_64F, 1., 0.)
+                .map_err(|_| SettingsError::Rectification)?;
+            let k2 = camera2.as_ref().unwrap().calibration.to_k();
+            let mut k2_converted = Mat::default();
+            k2.convert_to(&mut k2_converted, CV_64F, 1., 0.)
+                .map_err(|_| SettingsError::Rectification)?;
+
+            let tlr_mat =
+                read_param_mat(&settings, "Stereo.T_c1_c2").ok_or(SettingsError::Rectification)?;
+            let tlr = mat4x4_to_isometry3(&tlr_mat);
+
+            // Invert Tlr_ to get the transform that maps points from cam1 to cam2
+            // (R12, t12 as expected by stereoRectify).
+            let tlr_inv = tlr.inverse();
+            let r_mat = tlr_inv.rotation.to_rotation_matrix();
+            let r = r_mat.matrix();
+            let t = tlr_inv.translation.vector;
+            let r12 = Mat::from_slice_2d(&[
+                &[r[(0, 0)] as f64, r[(0, 1)] as f64, r[(0, 2)] as f64],
+                &[r[(1, 0)] as f64, r[(1, 1)] as f64, r[(1, 2)] as f64],
+                &[r[(2, 0)] as f64, r[(2, 1)] as f64, r[(2, 2)] as f64],
+            ])
+            .map_err(|_| SettingsError::Rectification)?;
+            let t12 = Mat::from_slice_2d(&[&[t[0] as f64], &[t[1] as f64], &[t[2] as f64]])
+                .map_err(|_| SettingsError::Rectification)?;
+
+            let dist1_mat = match &camera1.as_ref().unwrap().pinhole_distortion {
+                Some(d) => Mat::from_slice(d.as_slice())
+                    .map_err(|_| SettingsError::Rectification)?
+                    .try_clone()
+                    .map_err(|_| SettingsError::Rectification)?,
+                None => Mat::default(),
+            };
+            let dist2_mat = match &camera2.as_ref().unwrap().pinhole_distortion {
+                Some(d) => Mat::from_slice(d.as_slice())
+                    .map_err(|_| SettingsError::Rectification)?
+                    .try_clone()
+                    .map_err(|_| SettingsError::Rectification)?,
+                None => Mat::default(),
+            };
+
+            let new_im_size = image.new_size;
+            let mut r_r1_u1 = Mat::default();
+            let mut r_r2_u2 = Mat::default();
+            let mut p1 = Mat::default();
+            let mut p2 = Mat::default();
+            let mut q = Mat::default();
+            let mut valid_roi1 = Rect::default();
+            let mut valid_roi2 = Rect::default();
+            stereo_rectify(
+                &k1_converted,
+                &dist1_mat,
+                &k2_converted,
+                &dist2_mat,
+                new_im_size,
+                &r12,
+                &t12,
+                &mut r_r1_u1,
+                &mut r_r2_u2,
+                &mut p1,
+                &mut p2,
+                &mut q,
+                CALIB_ZERO_DISPARITY.into(),
+                -1.,
+                new_im_size,
+                &mut valid_roi1,
+                &mut valid_roi2,
+            )
+            .map_err(|_| SettingsError::Rectification)?;
+
+            // P1 and P2 are 3×4; extract the 3×3 upper-left block as new camera matrices.
+            let p1_3x3 =
+                Mat::roi(&p1, Rect::new(0, 0, 3, 3)).map_err(|_| SettingsError::Rectification)?;
+            let p2_3x3 =
+                Mat::roi(&p2, Rect::new(0, 0, 3, 3)).map_err(|_| SettingsError::Rectification)?;
+
+            let mut m1l = Mat::default();
+            let mut m2l = Mat::default();
+            init_undistort_rectify_map(
+                &k1_converted,
+                &dist1_mat,
+                &r_r1_u1,
+                &p1_3x3,
+                new_im_size,
+                CV_32F,
+                &mut m1l,
+                &mut m2l,
+            )
+            .map_err(|_| SettingsError::Rectification)?;
+
+            let mut m1r = Mat::default();
+            let mut m2r = Mat::default();
+            init_undistort_rectify_map(
+                &k2_converted,
+                &dist2_mat,
+                &r_r2_u2,
+                &p2_3x3,
+                new_im_size,
+                CV_32F,
+                &mut m1r,
+                &mut m2r,
+            )
+            .map_err(|_| SettingsError::Rectification)?;
+
+            // Update calibration
+            let cam1 = camera1.as_mut().unwrap();
+            cam1.calibration.set_parameter(
+                *p1.at_2d::<f64>(0, 0)
+                    .map_err(|_| SettingsError::Rectification)? as f32,
+                0,
+            );
+            cam1.calibration.set_parameter(
+                *p1.at_2d::<f64>(1, 1)
+                    .map_err(|_| SettingsError::Rectification)? as f32,
+                1,
+            );
+            cam1.calibration.set_parameter(
+                *p1.at_2d::<f64>(0, 2)
+                    .map_err(|_| SettingsError::Rectification)? as f32,
+                2,
+            );
+            cam1.calibration.set_parameter(
+                *p1.at_2d::<f64>(1, 2)
+                    .map_err(|_| SettingsError::Rectification)? as f32,
+                3,
+            );
+
+            // Update bf
+            let b = read_param_float(&settings, "Stereo.b").unwrap_or(0.0);
+            let bf = b
+                * (*p1
+                    .at_2d::<f64>(0, 0)
+                    .map_err(|_| SettingsError::Rectification)? as f32);
+
+            // Rectification rotates the left camera frame; propagate that into T_bc.
+            if matches!(sensor, Sensor::IMUStereo) {
+                if let Some(ref mut imu_info) = imu {
+                    let get = |row: i32, col: i32| -> Result<f32, SettingsError> {
+                        r_r1_u1
+                            .at_2d::<f64>(row, col)
+                            .map(|v| *v as f32)
+                            .map_err(|_| SettingsError::Rectification)
+                    };
+                    let r_val = Matrix3::new(
+                        get(0, 0)?,
+                        get(0, 1)?,
+                        get(0, 2)?,
+                        get(1, 0)?,
+                        get(1, 1)?,
+                        get(1, 2)?,
+                        get(2, 0)?,
+                        get(2, 1)?,
+                        get(2, 2)?,
+                    );
+                    // from_matrix_unchecked is safe: R_r1_u1 is an orthonormal rotation
+                    // output from stereoRectify.
+                    let rotation = UnitQuaternion::from_rotation_matrix(
+                        &Rotation3::from_matrix_unchecked(r_val),
+                    );
+                    let t_r1_u1 = Isometry3::from_parts(Translation3::identity(), rotation);
+                    imu_info.tbc = imu_info.tbc * t_r1_u1.inverse();
+                }
+            }
+
+            stereo = Some(StereoInfo {
+                tlr,
+                b,
+                bf,
+                m1l,
+                m2l,
+                m1r,
+                m2r,
+            });
+        }
+
+        info!("Settings succesfully loaded");
         Ok(Settings {
             sensor,
             camera_model,
@@ -176,6 +420,11 @@ impl Settings {
             image,
             imu,
             rgbd,
+            stereo,
+            orb,
+            viewer,
+            load_and_save,
+            other,
         })
     }
 
@@ -391,11 +640,11 @@ impl Settings {
             tbc = mat4x4_to_isometry3(&cv_tbc);
         }
         IMUInfo {
-            noise_gyro: read_param_float(storage, "IMU.NoiseGyro").unwrap_or(0.),
-            noise_acc: read_param_float(storage, "IMU.NoiseAcc").unwrap_or(0.),
-            gyro_walk: read_param_float(storage, "IMU.GyroWalk").unwrap_or(0.),
-            gyro_acc: read_param_float(storage, "IMU.AccWalk").unwrap_or(0.),
-            imu_frequency: read_param_float(storage, "IMU.Frequency").unwrap_or(0.),
+            noise_gyro: read_param_float(storage, "IMU.NoiseGyro").unwrap_or(1.7e-04),
+            noise_acc: read_param_float(storage, "IMU.NoiseAcc").unwrap_or(2.0e-03),
+            gyro_walk: read_param_float(storage, "IMU.GyroWalk").unwrap_or(1.9393e-05),
+            gyro_acc: read_param_float(storage, "IMU.AccWalk").unwrap_or(3.0e-03),
+            imu_frequency: read_param_float(storage, "IMU.Frequency").unwrap_or(200.0),
             tbc: tbc,
             insert_kfs_when_lost: read_param_bool(storage, "IMU.InsertKFsWhenLost").unwrap_or(true),
         }
@@ -408,6 +657,58 @@ impl Settings {
             th_depth: read_param_float(storage, "Stereo.ThDepth").unwrap_or(0.),
             b,
             bf: b * calib1_param,
+        }
+    }
+
+    fn read_orb(storage: &FileStorage) -> ORBInfo {
+        ORBInfo {
+            n_features: read_param_int(storage, "ORBextractor.nFeatures")
+                .unwrap_or(1200)
+                .try_into()
+                .unwrap_or(1200),
+            scale_factor: read_param_float(storage, "ORBextractor.scaleFactor").unwrap_or(0.),
+            n_levels: read_param_int(storage, "ORBextractor.nLevels")
+                .unwrap_or(8)
+                .try_into()
+                .unwrap_or(8),
+            init_th_fast: read_param_int(storage, "ORBextractor.iniThFAST")
+                .unwrap_or(20)
+                .try_into()
+                .unwrap_or(20),
+            min_th_fast: read_param_int(storage, "ORBextractor.minThFAST")
+                .unwrap_or(7)
+                .try_into()
+                .unwrap_or(7),
+        }
+    }
+
+    fn read_viewer(storage: &FileStorage) -> ViewerInfo {
+        ViewerInfo {
+            keyframe_size: read_param_float(storage, "Viewer.KeyFrameSize").unwrap_or(0.05),
+            keyframe_linewidth: read_param_float(storage, "Viewer.KeyFrameLineWidth")
+                .unwrap_or(1.05),
+            graph_linewidth: read_param_float(storage, "Viewer.GraphLineWidth").unwrap_or(0.9),
+            point_size: read_param_float(storage, "Viewer.PointSize").unwrap_or(2.0),
+            camera_size: read_param_float(storage, "Viewer.CameraSize").unwrap_or(0.08),
+            camera_linewidth: read_param_float(storage, "Viewer.CameraLineWidth").unwrap_or(3.0),
+            view_point_x: read_param_float(storage, "Viewer.ViewpointX").unwrap_or(0.0),
+            view_point_y: read_param_float(storage, "Viewer.ViewpointY").unwrap_or(-0.7),
+            view_point_z: read_param_float(storage, "Viewer.ViewpointZ").unwrap_or(-1.8),
+            view_point_f: read_param_float(storage, "Viewer.ViewpointF").unwrap_or(500.0),
+            image_viewer_scale: read_param_float(storage, "Viewer.imageViewScale").unwrap_or(1.0),
+        }
+    }
+
+    fn read_load_and_save(storage: &FileStorage) -> LoadAndSaveInfo {
+        LoadAndSaveInfo {
+            load_from: read_param_string(storage, "System.LoadAtlasFromFile"),
+            save_to: read_param_string(storage, "System.SaveAtlasToFile"),
+        }
+    }
+
+    fn read_other(storage: &FileStorage) -> OtherInfo {
+        OtherInfo {
+            th_far_points: read_param_float(storage, "System.thFarPoints"),
         }
     }
 }

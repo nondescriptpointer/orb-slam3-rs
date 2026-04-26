@@ -10,7 +10,7 @@ pub mod kannala_brandt8;
 pub mod pinhole;
 
 #[derive(Debug, Clone, Copy)]
-enum Type {
+pub enum Type {
     Pinhole,
     Fisheye,
 }
@@ -20,8 +20,6 @@ fn next_geometric_camera_id() -> u64 {
     NEXT_GEOMETRIC_CAMERA_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-// TODO: review if all this mix of datatypes is needed like this
-// might be better to keep a more consistent formatting
 // TODO: serialize
 pub trait GeometricCamera {
     fn new() -> Self

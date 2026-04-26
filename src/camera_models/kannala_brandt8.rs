@@ -129,7 +129,6 @@ impl KannalaBrandt8 {
         sigma_level: f32,
         unc: f32,
     ) -> Result<TriangulateMatchesResult, TriangulateMatchesError> {
-        // TODO: return result instead of option?
         let r1 = self.unproject_n(&kp1.pt());
         let r2 = camera.unproject_n(&kp2.pt());
 

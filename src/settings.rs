@@ -733,16 +733,6 @@ fn read_param_float(storage: &FileStorage, node: &str) -> Option<f32> {
     None
 }
 
-fn read_param_double(storage: &FileStorage, node: &str) -> Option<f64> {
-    let node = storage.get(node);
-    if let Ok(node) = node {
-        if node.is_real().expect("expected double") {
-            return Some(node.to_f64().expect("expected double"));
-        }
-    }
-    None
-}
-
 fn read_param_int(storage: &FileStorage, node: &str) -> Option<i64> {
     let node = storage.get(node);
     if let Ok(node) = node {

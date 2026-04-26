@@ -613,7 +613,7 @@ mod tests {
     /// Skipped on systems where the build step has not unpacked it.
     #[test]
     fn loads_real_orbvoc_if_present() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vocabulary/orbvoc.txt");
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("vocabulary/ORBvoc.txt");
         if !path.exists() {
             eprintln!("skipping: {} not present", path.display());
             return;

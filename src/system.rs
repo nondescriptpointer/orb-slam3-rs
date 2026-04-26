@@ -71,7 +71,8 @@ impl System {
         let keyframe_database = KeyframeDatabase::new(vocabulary);
 
         if let Some(load_path) = &settings.load_and_save.load_from {
-
+            // Load atlas
+        } else {
             // Create atlas
         }
 

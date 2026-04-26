@@ -11,7 +11,7 @@ use opencv::{
 use std::path::PathBuf;
 use tracing::info;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CameraType {
     PinHole = 0,
     Rectified = 1,
@@ -19,48 +19,48 @@ pub enum CameraType {
 }
 
 #[derive(Debug)]
-struct CameraInfo {
-    calibration: Box<dyn GeometricCamera>,
-    original_calibration: Box<dyn GeometricCamera>,
-    pinhole_distortion: Option<Vec<f32>>,
+pub struct CameraInfo {
+    pub calibration: Box<dyn GeometricCamera>,
+    pub original_calibration: Box<dyn GeometricCamera>,
+    pub pinhole_distortion: Option<Vec<f32>>,
 }
 
 #[derive(Debug)]
-struct ImageInfo {
-    original_size: Size,
-    new_size: Size,
-    need_to_resize: bool,
-    fps: i32,
-    rgb: bool,
+pub struct ImageInfo {
+    pub original_size: Size,
+    pub new_size: Size,
+    pub need_to_resize: bool,
+    pub fps: i32,
+    pub rgb: bool,
 }
 
 #[derive(Debug)]
-struct IMUInfo {
-    noise_gyro: f32,
-    noise_acc: f32,
-    gyro_walk: f32,
-    gyro_acc: f32,
-    imu_frequency: f32,
-    tbc: Isometry3<f32>,
-    insert_kfs_when_lost: bool,
+pub struct IMUInfo {
+    pub noise_gyro: f32,
+    pub noise_acc: f32,
+    pub gyro_walk: f32,
+    pub gyro_acc: f32,
+    pub imu_frequency: f32,
+    pub tbc: Isometry3<f32>,
+    pub insert_kfs_when_lost: bool,
 }
 
 #[derive(Debug)]
-struct RGBDInfo {
-    depth_map_factor: f32,
-    th_depth: f32,
-    b: f32,
-    bf: f32,
+pub struct RGBDInfo {
+    pub depth_map_factor: f32,
+    pub th_depth: f32,
+    pub b: f32,
+    pub bf: f32,
 }
 
-struct StereoInfo {
-    tlr: Isometry3<f32>,
-    b: f32,
-    bf: f32,
-    m1l: Mat,
-    m2l: Mat,
-    m1r: Mat,
-    m2r: Mat,
+pub struct StereoInfo {
+    pub tlr: Isometry3<f32>,
+    pub b: f32,
+    pub bf: f32,
+    pub m1l: Mat,
+    pub m2l: Mat,
+    pub m1r: Mat,
+    pub m2r: Mat,
 }
 
 // Mat does not implement Debug, so we hand-roll it.
@@ -75,56 +75,56 @@ impl std::fmt::Debug for StereoInfo {
 }
 
 #[derive(Debug)]
-struct ORBInfo {
-    n_features: i32,
-    scale_factor: f32,
-    n_levels: i32,
-    init_th_fast: i32,
-    min_th_fast: i32,
+pub struct ORBInfo {
+    pub n_features: i32,
+    pub scale_factor: f32,
+    pub n_levels: i32,
+    pub init_th_fast: i32,
+    pub min_th_fast: i32,
 }
 
 #[derive(Debug)]
-struct ViewerInfo {
-    keyframe_size: f32,
-    keyframe_linewidth: f32,
-    graph_linewidth: f32,
-    point_size: f32,
-    camera_size: f32,
-    camera_linewidth: f32,
-    view_point_x: f32,
-    view_point_y: f32,
-    view_point_z: f32,
-    view_point_f: f32,
-    image_viewer_scale: f32,
+pub struct ViewerInfo {
+    pub keyframe_size: f32,
+    pub keyframe_linewidth: f32,
+    pub graph_linewidth: f32,
+    pub point_size: f32,
+    pub camera_size: f32,
+    pub camera_linewidth: f32,
+    pub view_point_x: f32,
+    pub view_point_y: f32,
+    pub view_point_z: f32,
+    pub view_point_f: f32,
+    pub image_viewer_scale: f32,
 }
 
 #[derive(Debug)]
-struct LoadAndSaveInfo {
-    load_from: Option<String>,
-    save_to: Option<String>,
+pub struct LoadAndSaveInfo {
+    pub load_from: Option<String>,
+    pub save_to: Option<String>,
 }
 
 #[derive(Debug)]
-struct OtherInfo {
-    th_far_points: Option<f32>,
+pub struct OtherInfo {
+    pub th_far_points: Option<f32>,
 }
 
 #[derive(Debug)]
 pub struct Settings {
-    sensor: Sensor,
-    camera_model: CameraType,
-    camera1: Option<CameraInfo>,
-    camera2: Option<CameraInfo>,
-    need_to_rectify: bool,
-    need_to_undistort: bool,
-    image: ImageInfo,
-    imu: Option<IMUInfo>,
-    rgbd: Option<RGBDInfo>,
-    stereo: Option<StereoInfo>,
-    orb: ORBInfo,
-    viewer: ViewerInfo,
-    load_and_save: LoadAndSaveInfo,
-    other: OtherInfo,
+    pub sensor: Sensor,
+    pub camera_model: CameraType,
+    pub camera1: Option<CameraInfo>,
+    pub camera2: Option<CameraInfo>,
+    pub need_to_rectify: bool,
+    pub need_to_undistort: bool,
+    pub image: ImageInfo,
+    pub imu: Option<IMUInfo>,
+    pub rgbd: Option<RGBDInfo>,
+    pub stereo: Option<StereoInfo>,
+    pub orb: ORBInfo,
+    pub viewer: ViewerInfo,
+    pub load_and_save: LoadAndSaveInfo,
+    pub other: OtherInfo,
 }
 
 #[derive(Debug)]
@@ -231,6 +231,26 @@ impl Settings {
 
         // Precompute rectification maps
         let mut stereo = None;
+        // For pre-rectified stereo, baseline / ThDepth are still read from YAML.
+        if matches!(sensor, Sensor::Stereo | Sensor::IMUStereo)
+            && camera_model == CameraType::Rectified
+        {
+            let b = read_param_float(&settings, "Stereo.b").unwrap_or(0.0);
+            let fx = camera1
+                .as_ref()
+                .expect("camera1 missing")
+                .calibration
+                .get_parameter(0);
+            stereo = Some(StereoInfo {
+                tlr: Isometry3::identity(),
+                b,
+                bf: b * fx,
+                m1l: Mat::default(),
+                m2l: Mat::default(),
+                m1r: Mat::default(),
+                m2r: Mat::default(),
+            });
+        }
         if need_to_rectify {
             let k1 = camera1.as_ref().unwrap().calibration.to_k();
             let mut k1_converted = Mat::default();
@@ -713,6 +733,49 @@ impl Settings {
     }
 }
 
+impl std::fmt::Display for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "SLAM settings:")?;
+        let model = match self.camera_model {
+            CameraType::PinHole => "Pinhole",
+            CameraType::Rectified => "Rectified (Pinhole)",
+            CameraType::KannalaBrandt => "KannalaBrandt8 (Fisheye)",
+        };
+        writeln!(f, "\t-Camera model: {}", model)?;
+        if let Some(c) = &self.camera1 {
+            let cam = c.calibration.as_ref();
+            write!(f, "\t-Camera1 parameters: [")?;
+            for i in 0..cam.size() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", cam.get_parameter(i))?;
+            }
+            writeln!(f, "]")?;
+            if let Some(d) = &c.pinhole_distortion {
+                writeln!(f, "\t-Camera1 distortion parameters: {:?}", d)?;
+            }
+        }
+        writeln!(
+            f,
+            "\t-Original image size: [{}, {}]",
+            self.image.original_size.width, self.image.original_size.height
+        )?;
+        writeln!(
+            f,
+            "\t-Current image size: [{}, {}]",
+            self.image.new_size.width, self.image.new_size.height
+        )?;
+        writeln!(f, "\t-Sequence FPS: {}", self.image.fps)?;
+        writeln!(f, "\t-Features per image: {}", self.orb.n_features)?;
+        writeln!(f, "\t-ORB scale factor: {}", self.orb.scale_factor)?;
+        writeln!(f, "\t-ORB number of scales: {}", self.orb.n_levels)?;
+        writeln!(f, "\t-Initial FAST threshold: {}", self.orb.init_th_fast)?;
+        writeln!(f, "\t-Minimum FAST threshold: {}", self.orb.min_th_fast)?;
+        Ok(())
+    }
+}
+
 fn read_param_string(storage: &FileStorage, node: &str) -> Option<String> {
     let node = storage.get(node);
     if let Ok(node) = node {
@@ -790,4 +853,433 @@ fn mat4x4_to_isometry3(mat: &Mat) -> Isometry3<f32> {
     // from a calibration file and is assumed to be orthonormal.
     let rotation = UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(r));
     Isometry3::from_parts(t, rotation)
+}
+
+// ---------------------------------------------------------------------------
+// Tests — mirror tests/tests_settings.cpp from the C++ ORB-SLAM3 reference.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::system::Sensor;
+    use std::fs::File;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// RAII wrapper around a temporary YAML file
+    struct TempYaml {
+        path: PathBuf,
+    }
+    impl TempYaml {
+        fn new(body: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "orbslam3_settings_{}_{}.yaml",
+                std::process::id(),
+                n
+            ));
+            let mut f = File::create(&path).expect("create temp yaml");
+            // OpenCV's YAML parser requires the version directive on the first
+            // line; our Settings parser also requires `File.version: "1.0"`.
+            writeln!(f, "%YAML:1.0").unwrap();
+            writeln!(f, "---").unwrap();
+            writeln!(f, "File.version: \"1.0\"").unwrap();
+            f.write_all(body.as_bytes()).unwrap();
+            TempYaml { path }
+        }
+    }
+    impl Drop for TempYaml {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    const COMMON_IMAGE: &str = "Camera.width: 640\n\
+                                Camera.height: 480\n\
+                                Camera.fps: 30\n\
+                                Camera.RGB: 1\n";
+
+    const COMMON_ORB: &str = "ORBextractor.nFeatures: 1000\n\
+                              ORBextractor.scaleFactor: 1.2\n\
+                              ORBextractor.nLevels: 8\n\
+                              ORBextractor.iniThFAST: 20\n\
+                              ORBextractor.minThFAST: 7\n";
+
+    const COMMON_VIEWER: &str = "Viewer.KeyFrameSize: 0.05\n\
+                                 Viewer.KeyFrameLineWidth: 1.0\n\
+                                 Viewer.GraphLineWidth: 0.9\n\
+                                 Viewer.PointSize: 2.0\n\
+                                 Viewer.CameraSize: 0.08\n\
+                                 Viewer.CameraLineWidth: 3.0\n\
+                                 Viewer.ViewpointX: 0.0\n\
+                                 Viewer.ViewpointY: -0.7\n\
+                                 Viewer.ViewpointZ: -1.8\n\
+                                 Viewer.ViewpointF: 500.0\n";
+
+    fn pinhole_mono_yaml(with_distortion: bool, with_k3: bool, with_resize: bool) -> String {
+        let mut s = String::new();
+        s += "Camera.type: \"PinHole\"\n";
+        s += "Camera1.fx: 500.0\n";
+        s += "Camera1.fy: 510.0\n";
+        s += "Camera1.cx: 320.0\n";
+        s += "Camera1.cy: 240.0\n";
+        if with_distortion {
+            s += "Camera1.k1: 0.1\n";
+            s += "Camera1.k2: -0.05\n";
+            s += "Camera1.p1: 0.001\n";
+            s += "Camera1.p2: 0.002\n";
+            if with_k3 {
+                s += "Camera1.k3: 0.01\n";
+            }
+        }
+        s += COMMON_IMAGE;
+        if with_resize {
+            s += "Camera.newWidth: 320\n";
+            s += "Camera.newHeight: 240\n";
+        }
+        s += COMMON_ORB;
+        s += COMMON_VIEWER;
+        s
+    }
+
+    fn stereo_rectified_yaml() -> String {
+        let mut s = String::new();
+        s += "Camera.type: \"Rectified\"\n";
+        s += "Camera1.fx: 500.0\nCamera1.fy: 510.0\nCamera1.cx: 320.0\nCamera1.cy: 240.0\n";
+        s += "Camera2.fx: 500.0\nCamera2.fy: 510.0\nCamera2.cx: 320.0\nCamera2.cy: 240.0\n";
+        s += "Stereo.b: 0.12\n";
+        s += "Stereo.ThDepth: 35.0\n";
+        s += COMMON_IMAGE;
+        s += COMMON_ORB;
+        s += COMMON_VIEWER;
+        s
+    }
+
+    fn stereo_pinhole_yaml() -> String {
+        let mut s = String::new();
+        s += "Camera.type: \"PinHole\"\n";
+        s += "Camera1.fx: 500.0\nCamera1.fy: 510.0\nCamera1.cx: 320.0\nCamera1.cy: 240.0\n";
+        s += "Camera1.k1: 0.0\nCamera1.k2: 0.0\nCamera1.p1: 0.0\nCamera1.p2: 0.0\n";
+        s += "Camera2.fx: 500.0\nCamera2.fy: 510.0\nCamera2.cx: 320.0\nCamera2.cy: 240.0\n";
+        s += "Camera2.k1: 0.0\nCamera2.k2: 0.0\nCamera2.p1: 0.0\nCamera2.p2: 0.0\n";
+        // Use dt: d (CV_64F) — settings.rs reads matrices as f64.
+        s += "Stereo.T_c1_c2: !!opencv-matrix\n";
+        s += "  rows: 4\n  cols: 4\n  dt: d\n";
+        s += "  data: [1.0, 0.0, 0.0, 0.12,\n";
+        s += "         0.0, 1.0, 0.0, 0.0,\n";
+        s += "         0.0, 0.0, 1.0, 0.0,\n";
+        s += "         0.0, 0.0, 0.0, 1.0]\n";
+        s += "Stereo.b: 0.12\n";
+        s += "Stereo.ThDepth: 40.0\n";
+        s += COMMON_IMAGE;
+        s += COMMON_ORB;
+        s += COMMON_VIEWER;
+        s
+    }
+
+    fn kannala_brandt_mono_yaml() -> String {
+        let mut s = String::new();
+        s += "Camera.type: \"KannalaBrandt8\"\n";
+        s += "Camera1.fx: 380.0\nCamera1.fy: 380.0\nCamera1.cx: 320.0\nCamera1.cy: 240.0\n";
+        s += "Camera1.k1: 0.01\n";
+        s += "Camera1.k2: 0.001\n";
+        s += "Camera1.k3: -0.0005\n";
+        s += "Camera1.k4: 0.00001\n";
+        s += COMMON_IMAGE;
+        s += COMMON_ORB;
+        s += COMMON_VIEWER;
+        s
+    }
+
+    fn rgbd_yaml() -> String {
+        let mut s = String::new();
+        s += "Camera.type: \"PinHole\"\n";
+        s += "Camera1.fx: 500.0\nCamera1.fy: 510.0\nCamera1.cx: 320.0\nCamera1.cy: 240.0\n";
+        s += "RGBD.DepthMapFactor: 5000.0\n";
+        s += "Stereo.b: 0.05\n";
+        s += "Stereo.ThDepth: 40.0\n";
+        s += COMMON_IMAGE;
+        s += COMMON_ORB;
+        s += COMMON_VIEWER;
+        s
+    }
+
+    fn imu_mono_yaml(with_insert_kfs_when_lost: bool, insert_kfs_value: i32) -> String {
+        let mut s = String::new();
+        s += "Camera.type: \"PinHole\"\n";
+        s += "Camera1.fx: 500.0\nCamera1.fy: 510.0\nCamera1.cx: 320.0\nCamera1.cy: 240.0\n";
+        s += "IMU.NoiseGyro: 0.0017\n";
+        s += "IMU.NoiseAcc: 0.002\n";
+        s += "IMU.GyroWalk: 1.9e-05\n";
+        s += "IMU.AccWalk: 3.0e-03\n";
+        s += "IMU.Frequency: 200.0\n";
+        s += "IMU.T_b_c1: !!opencv-matrix\n";
+        s += "  rows: 4\n  cols: 4\n  dt: d\n";
+        s += "  data: [1.0, 0.0, 0.0, 0.05,\n";
+        s += "         0.0, 1.0, 0.0, 0.04,\n";
+        s += "         0.0, 0.0, 1.0, 0.03,\n";
+        s += "         0.0, 0.0, 0.0, 1.0]\n";
+        if with_insert_kfs_when_lost {
+            s += &format!("IMU.InsertKFsWhenLost: {}\n", insert_kfs_value);
+        }
+        s += COMMON_IMAGE;
+        s += COMMON_ORB;
+        s += COMMON_VIEWER;
+        s
+    }
+
+    fn approx(a: f32, b: f32) -> bool {
+        (a - b).abs() <= 1e-4_f32.max(b.abs() * 1e-4)
+    }
+
+    // Pinhole monocular
+    #[test]
+    fn pinhole_mono_without_distortion() {
+        let y = TempYaml::new(&pinhole_mono_yaml(false, false, false));
+        let s = Settings::new(&y.path, Sensor::Monocular).expect("settings");
+
+        assert_eq!(s.camera_model, CameraType::PinHole);
+        let cam = &s.camera1.as_ref().expect("camera1").calibration;
+        assert!(approx(cam.get_parameter(0), 500.0));
+        assert!(approx(cam.get_parameter(1), 510.0));
+        assert!(approx(cam.get_parameter(2), 320.0));
+        assert!(approx(cam.get_parameter(3), 240.0));
+
+        assert!(!s.need_to_undistort);
+        assert!(!s.image.need_to_resize);
+        assert!(!s.need_to_rectify);
+
+        assert_eq!(s.image.new_size.width, 640);
+        assert_eq!(s.image.new_size.height, 480);
+        assert_eq!(s.image.fps, 30);
+        assert!(s.image.rgb);
+    }
+
+    #[test]
+    fn pinhole_mono_with_4coef_distortion_triggers_undistort() {
+        let y = TempYaml::new(&pinhole_mono_yaml(true, false, false));
+        let s = Settings::new(&y.path, Sensor::Monocular).expect("settings");
+
+        assert_eq!(s.camera_model, CameraType::PinHole);
+        assert!(s.need_to_undistort);
+
+        let d = s
+            .camera1
+            .as_ref()
+            .unwrap()
+            .pinhole_distortion
+            .as_ref()
+            .expect("distortion");
+        assert_eq!(d.len(), 4);
+        assert!(approx(d[0], 0.1));
+        assert!(approx(d[1], -0.05));
+        assert!(approx(d[2], 0.001));
+        assert!(approx(d[3], 0.002));
+    }
+
+    #[test]
+    fn pinhole_mono_with_5coef_distortion() {
+        let y = TempYaml::new(&pinhole_mono_yaml(true, true, false));
+        let s = Settings::new(&y.path, Sensor::Monocular).expect("settings");
+
+        let d = s
+            .camera1
+            .as_ref()
+            .unwrap()
+            .pinhole_distortion
+            .as_ref()
+            .expect("distortion");
+        assert_eq!(d.len(), 5);
+        assert!(approx(d[4], 0.01));
+    }
+
+    #[test]
+    fn image_resize_updates_calibration_and_sets_need_to_resize() {
+        let y = TempYaml::new(&pinhole_mono_yaml(false, false, true));
+        let s = Settings::new(&y.path, Sensor::Monocular).expect("settings");
+
+        assert!(s.image.need_to_resize);
+        assert_eq!(s.image.new_size.width, 320);
+        assert_eq!(s.image.new_size.height, 240);
+
+        let cam = &s.camera1.as_ref().unwrap().calibration;
+        // half scale → fx, fy, cx, cy halved
+        assert!(approx(cam.get_parameter(0), 250.0));
+        assert!(approx(cam.get_parameter(1), 255.0));
+        assert!(approx(cam.get_parameter(2), 160.0));
+        assert!(approx(cam.get_parameter(3), 120.0));
+    }
+
+    // KannalaBrandt monocular
+    #[test]
+    fn kannala_brandt8_monocular() {
+        let y = TempYaml::new(&kannala_brandt_mono_yaml());
+        let s = Settings::new(&y.path, Sensor::Monocular).expect("settings");
+
+        assert_eq!(s.camera_model, CameraType::KannalaBrandt);
+        let cam_info = s.camera1.as_ref().expect("camera1");
+        let cam = &cam_info.calibration;
+        // 4 intrinsics + 4 distortion params packed into the camera object.
+        assert_eq!(cam.size(), 8);
+        assert!(approx(cam.get_parameter(0), 380.0));
+        assert!(approx(cam.get_parameter(4), 0.01));
+        assert!(approx(cam.get_parameter(7), 0.00001));
+        // KB monocular does not populate the pinhole distortion vector.
+        assert!(!s.need_to_undistort);
+        assert!(cam_info.pinhole_distortion.is_none());
+    }
+
+    // Stereo
+    #[test]
+    fn stereo_rectified_uses_stereo_b_directly() {
+        let y = TempYaml::new(&stereo_rectified_yaml());
+        let s = Settings::new(&y.path, Sensor::Stereo).expect("settings");
+
+        assert_eq!(s.camera_model, CameraType::Rectified);
+        assert!(!s.need_to_rectify);
+        let stereo = s.stereo.as_ref().expect("stereo");
+        assert!(approx(stereo.b, 0.12));
+        assert!(approx(stereo.bf, 0.12 * 500.0));
+    }
+
+    #[test]
+    fn stereo_pinhole_with_t_c1_c2_triggers_rectification_maps() {
+        let y = TempYaml::new(&stereo_pinhole_yaml());
+        let s = Settings::new(&y.path, Sensor::Stereo).expect("settings");
+
+        assert_eq!(s.camera_model, CameraType::PinHole);
+        assert!(s.need_to_rectify);
+
+        let stereo = s.stereo.as_ref().expect("stereo");
+        // Baseline = ‖t‖ from T_c1_c2.
+        assert!(approx(stereo.b, 0.12));
+
+        // Rectification maps must have been precomputed.
+        assert!(!stereo.m1l.empty());
+        assert!(!stereo.m2l.empty());
+        assert!(!stereo.m1r.empty());
+        assert!(!stereo.m2r.empty());
+        assert_eq!(stereo.m1l.size().unwrap(), s.image.new_size);
+        assert_eq!(stereo.m1r.size().unwrap(), s.image.new_size);
+
+        // bf must have been recomputed using P1(0,0).
+        let fx = s.camera1.as_ref().unwrap().calibration.get_parameter(0);
+        assert!(approx(stereo.bf, stereo.b * fx));
+
+        // Tlr translation magnitude == baseline.
+        assert!(approx(stereo.tlr.translation.vector.norm(), 0.12));
+    }
+
+    // RGB-D
+    #[test]
+    fn rgbd_parses_depth_map_factor_and_stereo_baseline() {
+        let y = TempYaml::new(&rgbd_yaml());
+        let s = Settings::new(&y.path, Sensor::RGBD).expect("settings");
+
+        let rgbd = s.rgbd.as_ref().expect("rgbd");
+        assert!(approx(rgbd.depth_map_factor, 5000.0));
+        assert!(approx(rgbd.b, 0.05));
+        assert!(approx(rgbd.bf, 0.05 * 500.0));
+        assert!(approx(rgbd.th_depth, 40.0));
+    }
+
+    // IMU
+    #[test]
+    fn imu_monocular_parses_noise_walk_tbc_and_default_insert_kfs_when_lost() {
+        let y = TempYaml::new(&imu_mono_yaml(false, 0));
+        let s = Settings::new(&y.path, Sensor::IMUMonocular).expect("settings");
+
+        let imu = s.imu.as_ref().expect("imu");
+        assert!(approx(imu.noise_gyro, 0.0017));
+        assert!(approx(imu.noise_acc, 0.002));
+        assert!(approx(imu.gyro_walk, 1.9e-5));
+        // NOTE: stored as `gyro_acc` in IMUInfo (historical typo for AccWalk).
+        assert!(approx(imu.gyro_acc, 3.0e-3));
+        assert!(approx(imu.imu_frequency, 200.0));
+
+        assert!(approx(imu.tbc.translation.vector.x, 0.05));
+        assert!(approx(imu.tbc.translation.vector.y, 0.04));
+        assert!(approx(imu.tbc.translation.vector.z, 0.03));
+
+        // Default when key absent.
+        assert!(imu.insert_kfs_when_lost);
+    }
+
+    #[test]
+    fn imu_insert_kfs_when_lost_honored_false() {
+        let y = TempYaml::new(&imu_mono_yaml(true, 0));
+        let s = Settings::new(&y.path, Sensor::IMUMonocular).expect("settings");
+        assert!(!s.imu.as_ref().unwrap().insert_kfs_when_lost);
+    }
+
+    #[test]
+    fn imu_insert_kfs_when_lost_honored_true() {
+        let y = TempYaml::new(&imu_mono_yaml(true, 1));
+        let s = Settings::new(&y.path, Sensor::IMUMonocular).expect("settings");
+        assert!(s.imu.as_ref().unwrap().insert_kfs_when_lost);
+    }
+
+    // ORB / Viewer / optional parameters
+    #[test]
+    fn orb_and_viewer_parameters_round_trip() {
+        let y = TempYaml::new(&pinhole_mono_yaml(false, false, false));
+        let s = Settings::new(&y.path, Sensor::Monocular).expect("settings");
+
+        assert_eq!(s.orb.n_features, 1000);
+        assert!(approx(s.orb.scale_factor, 1.2));
+        assert_eq!(s.orb.n_levels, 8);
+        assert_eq!(s.orb.init_th_fast, 20);
+        assert_eq!(s.orb.min_th_fast, 7);
+
+        assert!(approx(s.viewer.keyframe_size, 0.05));
+        assert!(approx(s.viewer.keyframe_linewidth, 1.0));
+        assert!(approx(s.viewer.graph_linewidth, 0.9));
+        assert!(approx(s.viewer.point_size, 2.0));
+        assert!(approx(s.viewer.camera_size, 0.08));
+        assert!(approx(s.viewer.camera_linewidth, 3.0));
+        assert!(approx(s.viewer.view_point_x, 0.0));
+        assert!(approx(s.viewer.view_point_y, -0.7));
+        assert!(approx(s.viewer.view_point_z, -1.8));
+        assert!(approx(s.viewer.view_point_f, 500.0));
+
+        // imageViewScale defaults to 1.0 when absent.
+        assert!(approx(s.viewer.image_viewer_scale, 1.0));
+
+        // Atlas load/save are optional → None when absent.
+        assert!(s.load_and_save.load_from.is_none());
+        assert!(s.load_and_save.save_to.is_none());
+    }
+
+    #[test]
+    fn optional_atlas_load_save_and_image_view_scale_parsed_when_present() {
+        let mut body = pinhole_mono_yaml(false, false, false);
+        body += "Viewer.imageViewScale: 0.5\n";
+        body += "System.LoadAtlasFromFile: \"my_atlas\"\n";
+        body += "System.SaveAtlasToFile: \"out_atlas\"\n";
+        body += "System.thFarPoints: 50.0\n";
+        let y = TempYaml::new(&body);
+        let s = Settings::new(&y.path, Sensor::Monocular).expect("settings");
+
+        assert!(approx(s.viewer.image_viewer_scale, 0.5));
+        assert_eq!(s.load_and_save.load_from.as_deref(), Some("my_atlas"));
+        assert_eq!(s.load_and_save.save_to.as_deref(), Some("out_atlas"));
+        assert!(approx(s.other.th_far_points.expect("thFarPoints"), 50.0));
+    }
+
+    // Display impl
+    #[test]
+    fn display_emits_human_readable_summary() {
+        let y = TempYaml::new(&pinhole_mono_yaml(true, false, false));
+        let s = Settings::new(&y.path, Sensor::Monocular).expect("settings");
+
+        let text = format!("{}", s);
+        assert!(text.contains("SLAM settings"));
+        assert!(text.contains("Pinhole"));
+        assert!(text.contains("distortion parameters"));
+        assert!(text.contains("Sequence FPS"));
+        assert!(text.contains("Features per image"));
+    }
 }

@@ -124,6 +124,7 @@ pub struct Settings {
     pub orb: ORBInfo,
     pub viewer: ViewerInfo,
     pub load_and_save: LoadAndSaveInfo,
+    pub loop_closing: bool,
     pub other: OtherInfo,
 }
 
@@ -228,6 +229,7 @@ impl Settings {
         let viewer = Self::read_viewer(&settings);
         let load_and_save = Self::read_load_and_save(&settings);
         let other = Self::read_other(&settings);
+        let loop_closing = read_param_bool(&settings, "loopClosing").unwrap_or(false);
 
         // Precompute rectification maps
         let mut stereo = None;
@@ -444,6 +446,7 @@ impl Settings {
             orb,
             viewer,
             load_and_save,
+            loop_closing,
             other,
         })
     }

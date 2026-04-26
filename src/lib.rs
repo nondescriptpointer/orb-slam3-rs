@@ -1,5 +1,10 @@
+pub mod atlas;
 pub mod camera_models;
 pub mod geometric_tools;
+pub mod keyframe;
+pub mod keyframe_database;
+pub mod map;
+pub mod orb_vocabulary;
 pub mod settings;
 pub mod system;
 pub mod two_view_reconstruction;

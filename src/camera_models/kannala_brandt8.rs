@@ -1,6 +1,4 @@
-use nalgebra::{
-    Isometry3, Matrix, Matrix2x3, Matrix3, Matrix3x4, Matrix4, Point2, Point3, Vector3,
-};
+use nalgebra::{Isometry3, Matrix2x3, Matrix3, Matrix3x4, Matrix4, Point2, Point3, Vector3};
 use opencv::{
     calib3d,
     core::{
@@ -588,7 +586,7 @@ impl GeometricCamera for KannalaBrandt8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nalgebra::{Matrix2x1, Rotation3};
+    use nalgebra::Rotation3;
     use opencv::prelude::*;
 
     const FX: f32 = 190.0;

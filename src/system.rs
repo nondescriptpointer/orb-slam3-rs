@@ -1,7 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::info;
 
-use crate::settings::{Settings, SettingsError};
+use crate::{
+    keyframe_database::KeyframeDatabase,
+    orb_vocabulary::{OrbVocabulary, VocabularyError},
+    settings::{Settings, SettingsError},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sensor {
@@ -21,11 +26,15 @@ pub struct System {
     activate_localization_mode: bool,
     deactivate_localization_mode: bool,
     shutdown: bool,
+    vocabulary_file_path: PathBuf,
+    load_atlas_file_path: Option<String>,
+    save_atlas_file_path: Option<String>,
 }
 
 #[derive(Debug)]
 pub enum SystemError {
     InvalidSettings(SettingsError),
+    InvalidORBVocabulary(VocabularyError),
 }
 
 impl System {
@@ -50,6 +59,23 @@ impl System {
         // Load settings
         let settings =
             Settings::new(settings_path, sensor).map_err(|e| SystemError::InvalidSettings(e))?;
+        let loop_closing = settings.loop_closing;
+
+        // Load ORB VOB vocabulary
+        info!("Loading ORB vocabulary. This could take a while...");
+        let vocabulary = OrbVocabulary::load_from_text_file(vocabulary_path)
+            .map_err(|e| SystemError::InvalidORBVocabulary(e))?;
+        info!("ORB vocabulary loaded!");
+        let vocabulary = Arc::new(vocabulary);
+        // Create keyframe database
+        let keyframe_database = KeyframeDatabase::new(vocabulary);
+
+        if let Some(load_path) = &settings.load_and_save.load_from {
+
+            // Create atlas
+        }
+
+        // TODO: here
 
         Ok(System {
             sensor,
@@ -58,6 +84,9 @@ impl System {
             activate_localization_mode: false,
             deactivate_localization_mode: false,
             shutdown: false,
+            vocabulary_file_path: vocabulary_path.clone(),
+            load_atlas_file_path: settings.load_and_save.load_from.clone(),
+            save_atlas_file_path: settings.load_and_save.save_to.clone(),
         })
     }
 }

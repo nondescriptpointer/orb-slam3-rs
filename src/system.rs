@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::{
-    keyframe_database::KeyframeDatabase,
+    key_frame_database::KeyFrameDatabase,
     orb_vocabulary::{OrbVocabulary, VocabularyError},
     settings::{Settings, SettingsError},
 };
@@ -68,7 +68,7 @@ impl System {
         info!("ORB vocabulary loaded!");
         let vocabulary = Arc::new(vocabulary);
         // Create keyframe database
-        let keyframe_database = KeyframeDatabase::new(vocabulary);
+        let keyframe_database = KeyFrameDatabase::new(vocabulary);
 
         if let Some(load_path) = &settings.load_and_save.load_from {
             // Load atlas

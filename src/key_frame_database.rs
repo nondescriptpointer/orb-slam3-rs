@@ -2,7 +2,7 @@
 The data model differs from ORB-SLAM3's C++ implementation in
 a few deliberate ways:
 
-- Keyframes are addressed by id, not by pointer. This keeps the database
+- KeyFrames are addressed by id, not by pointer. This keeps the database
 trivially serializable and free of lock cycles.
 
 - Per-query scratch state is local. This uses per-call HashMap instead,
@@ -19,50 +19,50 @@ use std::sync::{Arc, RwLock};
 
 use crate::orb_vocabulary::{BowVector, OrbVocabulary};
 
-/// Stable identifier for a Keyframe
+/// Stable identifier for a KeyFrame
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct KeyframeId(pub u64);
+pub struct KeyFrameId(pub u64);
 
 /// Stable identifier for a map within the atlas
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MapId(pub u64);
 
-pub trait KeyframeView {
+pub trait KeyFrameView {
     /// Cached bag-of-words vector for `kf`, or `None` if the id is unknown.
-    fn bow_vec(&self, kf: KeyframeId) -> Option<&BowVector>;
+    fn bow_vec(&self, kf: KeyFrameId) -> Option<&BowVector>;
 
     /// Map that owns `kf`, or `None` if the id is unknown.
-    fn map_id(&self, kf: KeyframeId) -> Option<MapId>;
+    fn map_id(&self, kf: KeyFrameId) -> Option<MapId>;
 
-    /// Whether the Keyframe has been flagged as bad (culled).
-    fn is_bad(&self, kf: KeyframeId) -> bool;
+    /// Whether the KeyFrame has been flagged as bad (culled).
+    fn is_bad(&self, kf: KeyFrameId) -> bool;
 
     /// Whether the map has been flagged as bad. Used to suppress merge
     /// candidates from dead maps.
     fn is_map_bad(&self, map: MapId) -> bool;
 
     /// Up to `n` best covisibility neighbours of `kf` (highest weights
-    /// first). May return fewer if the Keyframe has fewer neighbours.
-    fn best_covisibility(&self, kf: KeyframeId, n: usize) -> Vec<KeyframeId>;
+    /// first). May return fewer if the KeyFrame has fewer neighbours.
+    fn best_covisibility(&self, kf: KeyFrameId, n: usize) -> Vec<KeyFrameId>;
 
-    /// Set of Keyframes connected to `kf` in the covisibility graph; these
+    /// Set of KeyFrames connected to `kf` in the covisibility graph; these
     /// are excluded as candidates.
-    fn connected_keyframes(&self, kf: KeyframeId) -> HashSet<KeyframeId>;
+    fn connected_keyframes(&self, kf: KeyFrameId) -> HashSet<KeyFrameId>;
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct Candidates {
-    pub loop_: Vec<KeyframeId>,
-    pub merge: Vec<KeyframeId>,
+    pub loop_: Vec<KeyFrameId>,
+    pub merge: Vec<KeyFrameId>,
 }
 
 #[derive(Debug)]
-pub struct KeyframeDatabase {
+pub struct KeyFrameDatabase {
     voc: Arc<OrbVocabulary>,
-    inverted: RwLock<Vec<Vec<KeyframeId>>>,
+    inverted: RwLock<Vec<Vec<KeyFrameId>>>,
 }
 
-impl KeyframeDatabase {
+impl KeyFrameDatabase {
     pub fn new(voc: Arc<OrbVocabulary>) -> Self {
         let n_words = voc.size();
         Self {
@@ -77,9 +77,9 @@ impl KeyframeDatabase {
     }
 
     /// Register `kf` under each word it contains. The caller passes the BoW
-    /// rather than us pulling it from a `KeyframeView` so this works during
-    /// Keyframe construction, before the Keyframe is published.
-    pub fn add(&self, kf: KeyframeId, bow: &BowVector) {
+    /// rather than us pulling it from a `KeyFrameView` so this works during
+    /// KeyFrame construction, before the KeyFrame is published.
+    pub fn add(&self, kf: KeyFrameId, bow: &BowVector) {
         let mut inv = self.inverted.write().expect("poisoned");
         for &word in bow.0.keys() {
             if let Some(bucket) = inv.get_mut(word as usize) {
@@ -90,7 +90,7 @@ impl KeyframeDatabase {
 
     /// Remove `kf` from each bucket it appears in. The BoW must match the
     /// one used at `add` time (same set of words).
-    pub fn erase(&self, kf: KeyframeId, bow: &BowVector) {
+    pub fn erase(&self, kf: KeyFrameId, bow: &BowVector) {
         let mut inv = self.inverted.write().expect("poisoned");
         for &word in bow.0.keys() {
             if let Some(bucket) = inv.get_mut(word as usize)
@@ -110,8 +110,8 @@ impl KeyframeDatabase {
         }
     }
 
-    /// Drop every Keyframe that belongs to `map`.
-    pub fn clear_map(&self, view: &dyn KeyframeView, map: MapId) {
+    /// Drop every KeyFrame that belongs to `map`.
+    pub fn clear_map(&self, view: &dyn KeyFrameView, map: MapId) {
         let mut inv = self.inverted.write().expect("poisoned");
         for bucket in inv.iter_mut() {
             bucket.retain(|&kf| view.map_id(kf) != Some(map));
@@ -132,10 +132,10 @@ impl KeyframeDatabase {
     // Deprecated
     pub fn detect_loop_candidates(
         &self,
-        view: &dyn KeyframeView,
-        query: KeyframeId,
+        view: &dyn KeyFrameView,
+        query: KeyFrameId,
         min_score: f32,
-    ) -> Vec<KeyframeId> {
+    ) -> Vec<KeyFrameId> {
         let Some(query_bow) = view.bow_vec(query) else {
             return Vec::new();
         };
@@ -161,7 +161,7 @@ impl KeyframeDatabase {
         }
 
         // Phase 3: covisibility accumulation, 0.75·best_acc cutoff.
-        let scores_map: HashMap<KeyframeId, f32> =
+        let scores_map: HashMap<KeyFrameId, f32> =
             scored.iter().map(|&(score, kf)| (kf, score)).collect();
         let (acc, best_acc) =
             accumulate_covisibility(view, &scored, &scores_map, query, min_words, min_score);
@@ -170,8 +170,8 @@ impl KeyframeDatabase {
 
     pub fn detect_loop_and_merge_candidates(
         &self,
-        view: &dyn KeyframeView,
-        query: KeyframeId,
+        view: &dyn KeyFrameView,
+        query: KeyFrameId,
         min_score: f32,
     ) -> Candidates {
         let mut out = Candidates::default();
@@ -184,8 +184,8 @@ impl KeyframeDatabase {
         let connected = view.connected_keyframes(query);
 
         // Two parallel sharing maps: same-map → loop, other-(live)-map → merge.
-        let mut loop_share: HashMap<KeyframeId, u32> = HashMap::new();
-        let mut merge_share: HashMap<KeyframeId, u32> = HashMap::new();
+        let mut loop_share: HashMap<KeyFrameId, u32> = HashMap::new();
+        let mut merge_share: HashMap<KeyFrameId, u32> = HashMap::new();
         {
             let inv = self.inverted.read().expect("poisoned");
             for &word in query_bow.0.keys() {
@@ -216,8 +216,8 @@ impl KeyframeDatabase {
 
     pub fn detect_best_candidates(
         &self,
-        view: &dyn KeyframeView,
-        query: KeyframeId,
+        view: &dyn KeyFrameView,
+        query: KeyFrameId,
         n_min_words: u32,
     ) -> Candidates {
         let mut out = Candidates::default();
@@ -242,7 +242,7 @@ impl KeyframeDatabase {
             return out;
         }
 
-        let scores_map: HashMap<KeyframeId, f32> =
+        let scores_map: HashMap<KeyFrameId, f32> =
             scored.iter().map(|&(score, kf)| (kf, score)).collect();
         let (acc, best_acc) =
             accumulate_covisibility(view, &scored, &scores_map, query, min_words, 0.0);
@@ -261,8 +261,8 @@ impl KeyframeDatabase {
 
     pub fn detect_n_best_candidates(
         &self,
-        view: &dyn KeyframeView,
-        query: KeyframeId,
+        view: &dyn KeyFrameView,
+        query: KeyFrameId,
         n: usize,
     ) -> Candidates {
         let mut out = Candidates::default();
@@ -290,7 +290,7 @@ impl KeyframeDatabase {
             return out;
         }
 
-        let scores_map: HashMap<KeyframeId, f32> =
+        let scores_map: HashMap<KeyFrameId, f32> =
             scored.iter().map(|&(score, kf)| (kf, score)).collect();
         let (mut acc, _best_acc) =
             accumulate_covisibility(view, &scored, &scores_map, query, min_words, 0.0);
@@ -302,7 +302,7 @@ impl KeyframeDatabase {
                 .then(a.1.cmp(&b.1))
         });
 
-        let mut already = HashSet::<KeyframeId>::new();
+        let mut already = HashSet::<KeyFrameId>::new();
         for (_score, kf) in acc {
             if out.loop_.len() >= n && out.merge.len() >= n {
                 break;
@@ -332,10 +332,10 @@ impl KeyframeDatabase {
 
     pub fn detect_relocalization_candidates(
         &self,
-        view: &dyn KeyframeView,
+        view: &dyn KeyFrameView,
         query_bow: &BowVector,
         map: MapId,
-    ) -> Vec<KeyframeId> {
+    ) -> Vec<KeyFrameId> {
         // No connected-set filter — a Frame has no covisibility yet.
         let sharing = self.scan_sharing_words(query_bow, |_| true);
         if sharing.is_empty() {
@@ -349,14 +349,14 @@ impl KeyframeDatabase {
             return Vec::new();
         }
 
-        let scores_map: HashMap<KeyframeId, f32> =
+        let scores_map: HashMap<KeyFrameId, f32> =
             scored.iter().map(|&(score, kf)| (kf, score)).collect();
         let (acc, best_acc) = accumulate_covisibility(
             view,
             &scored,
             &scores_map,
             // No "self" KF to exclude — use a sentinel that can't appear.
-            KeyframeId(u64::MAX),
+            KeyFrameId(u64::MAX),
             min_words,
             0.0,
         );
@@ -371,9 +371,9 @@ impl KeyframeDatabase {
     fn scan_sharing_words(
         &self,
         query_bow: &BowVector,
-        mut accept: impl FnMut(KeyframeId) -> bool,
-    ) -> HashMap<KeyframeId, u32> {
-        let mut sharing: HashMap<KeyframeId, u32> = HashMap::new();
+        mut accept: impl FnMut(KeyFrameId) -> bool,
+    ) -> HashMap<KeyFrameId, u32> {
+        let mut sharing: HashMap<KeyFrameId, u32> = HashMap::new();
         let inv = self.inverted.read().expect("poisoned");
         for &word in query_bow.0.keys() {
             let Some(bucket) = inv.get(word as usize) else {
@@ -399,12 +399,12 @@ impl KeyframeDatabase {
 
     fn finalize_with_cutoff(
         &self,
-        view: &dyn KeyframeView,
-        query: KeyframeId,
+        view: &dyn KeyFrameView,
+        query: KeyFrameId,
         query_bow: &BowVector,
-        sharing: &HashMap<KeyframeId, u32>,
+        sharing: &HashMap<KeyFrameId, u32>,
         min_score: f32,
-    ) -> Vec<KeyframeId> {
+    ) -> Vec<KeyFrameId> {
         if sharing.is_empty() {
             return Vec::new();
         }
@@ -414,7 +414,7 @@ impl KeyframeDatabase {
         if scored.is_empty() {
             return Vec::new();
         }
-        let scores_map: HashMap<KeyframeId, f32> =
+        let scores_map: HashMap<KeyFrameId, f32> =
             scored.iter().map(|&(score, kf)| (kf, score)).collect();
         let (acc, best_acc) = accumulate_covisibility(
             view,
@@ -429,13 +429,13 @@ impl KeyframeDatabase {
 }
 
 fn score_candidates(
-    view: &dyn KeyframeView,
+    view: &dyn KeyFrameView,
     query_bow: &BowVector,
     voc: &OrbVocabulary,
-    sharing: &HashMap<KeyframeId, u32>,
+    sharing: &HashMap<KeyFrameId, u32>,
     min_words: u32,
     min_score: f32,
-) -> Vec<(f32, KeyframeId)> {
+) -> Vec<(f32, KeyFrameId)> {
     let mut out = Vec::with_capacity(sharing.len());
     for (&kf, &words) in sharing {
         if words <= min_words {
@@ -453,14 +453,14 @@ fn score_candidates(
 }
 
 fn accumulate_covisibility(
-    view: &dyn KeyframeView,
-    scored: &[(f32, KeyframeId)],
-    scores_by_kf: &HashMap<KeyframeId, f32>,
-    query: KeyframeId,
+    view: &dyn KeyFrameView,
+    scored: &[(f32, KeyFrameId)],
+    scores_by_kf: &HashMap<KeyFrameId, f32>,
+    query: KeyFrameId,
     _min_words: u32,
     init_best: f32,
-) -> (Vec<(f32, KeyframeId)>, f32) {
-    let mut acc_list: Vec<(f32, KeyframeId)> = Vec::with_capacity(scored.len());
+) -> (Vec<(f32, KeyFrameId)>, f32) {
+    let mut acc_list: Vec<(f32, KeyFrameId)> = Vec::with_capacity(scored.len());
     let mut best_acc = init_best;
 
     for &(score, kf) in scored {
@@ -494,8 +494,8 @@ fn accumulate_covisibility(
     (acc_list, best_acc)
 }
 
-fn select_above_cutoff(acc: &[(f32, KeyframeId)], cutoff: f32) -> Vec<KeyframeId> {
-    let mut seen = HashSet::<KeyframeId>::new();
+fn select_above_cutoff(acc: &[(f32, KeyFrameId)], cutoff: f32) -> Vec<KeyFrameId> {
+    let mut seen = HashSet::<KeyFrameId>::new();
     let mut out = Vec::with_capacity(acc.len());
     for &(score, kf) in acc {
         if score > cutoff && seen.insert(kf) {
@@ -515,42 +515,42 @@ mod tests {
         bow: BowVector,
         map: MapId,
         bad: bool,
-        covis: Vec<KeyframeId>,
-        connected: HashSet<KeyframeId>,
+        covis: Vec<KeyFrameId>,
+        connected: HashSet<KeyFrameId>,
     }
 
     #[derive(Default)]
     struct MockView {
-        kfs: HashMap<KeyframeId, MockKf>,
+        kfs: HashMap<KeyFrameId, MockKf>,
         bad_maps: HashSet<MapId>,
     }
 
     impl MockView {
-        fn insert(&mut self, id: KeyframeId, kf: MockKf) {
+        fn insert(&mut self, id: KeyFrameId, kf: MockKf) {
             self.kfs.insert(id, kf);
         }
     }
 
-    impl KeyframeView for MockView {
-        fn bow_vec(&self, kf: KeyframeId) -> Option<&BowVector> {
+    impl KeyFrameView for MockView {
+        fn bow_vec(&self, kf: KeyFrameId) -> Option<&BowVector> {
             self.kfs.get(&kf).map(|k| &k.bow)
         }
-        fn map_id(&self, kf: KeyframeId) -> Option<MapId> {
+        fn map_id(&self, kf: KeyFrameId) -> Option<MapId> {
             self.kfs.get(&kf).map(|k| k.map)
         }
-        fn is_bad(&self, kf: KeyframeId) -> bool {
+        fn is_bad(&self, kf: KeyFrameId) -> bool {
             self.kfs.get(&kf).map(|k| k.bad).unwrap_or(true)
         }
         fn is_map_bad(&self, map: MapId) -> bool {
             self.bad_maps.contains(&map)
         }
-        fn best_covisibility(&self, kf: KeyframeId, n: usize) -> Vec<KeyframeId> {
+        fn best_covisibility(&self, kf: KeyFrameId, n: usize) -> Vec<KeyFrameId> {
             self.kfs
                 .get(&kf)
                 .map(|k| k.covis.iter().take(n).copied().collect())
                 .unwrap_or_default()
         }
-        fn connected_keyframes(&self, kf: KeyframeId) -> HashSet<KeyframeId> {
+        fn connected_keyframes(&self, kf: KeyFrameId) -> HashSet<KeyFrameId> {
             self.kfs
                 .get(&kf)
                 .map(|k| k.connected.clone())
@@ -591,9 +591,9 @@ mod tests {
     #[test]
     fn add_then_erase_round_trips() {
         let voc = tiny_voc();
-        let db = KeyframeDatabase::new(voc);
+        let db = KeyFrameDatabase::new(voc);
 
-        let kf = KeyframeId(42);
+        let kf = KeyFrameId(42);
         let b = bow(&[0, 2]);
         db.add(kf, &b);
         assert_eq!(db._entry_count(), 2);
@@ -604,9 +604,9 @@ mod tests {
     #[test]
     fn clear_empties_all_buckets() {
         let voc = tiny_voc();
-        let db = KeyframeDatabase::new(voc);
-        db.add(KeyframeId(1), &bow(&[0, 1, 2, 3]));
-        db.add(KeyframeId(2), &bow(&[0, 2]));
+        let db = KeyFrameDatabase::new(voc);
+        db.add(KeyFrameId(1), &bow(&[0, 1, 2, 3]));
+        db.add(KeyFrameId(2), &bow(&[0, 2]));
         assert_eq!(db._entry_count(), 6);
         db.clear();
         assert_eq!(db._entry_count(), 0);
@@ -615,10 +615,10 @@ mod tests {
     #[test]
     fn clear_map_only_removes_target_map() {
         let voc = tiny_voc();
-        let db = KeyframeDatabase::new(voc);
+        let db = KeyFrameDatabase::new(voc);
         let mut view = MockView::default();
         view.insert(
-            KeyframeId(1),
+            KeyFrameId(1),
             MockKf {
                 bow: bow(&[0, 1]),
                 map: MapId(7),
@@ -626,15 +626,15 @@ mod tests {
             },
         );
         view.insert(
-            KeyframeId(2),
+            KeyFrameId(2),
             MockKf {
                 bow: bow(&[0, 1]),
                 map: MapId(8),
                 ..Default::default()
             },
         );
-        db.add(KeyframeId(1), &view.kfs[&KeyframeId(1)].bow);
-        db.add(KeyframeId(2), &view.kfs[&KeyframeId(2)].bow);
+        db.add(KeyFrameId(1), &view.kfs[&KeyFrameId(1)].bow);
+        db.add(KeyFrameId(2), &view.kfs[&KeyFrameId(2)].bow);
         assert_eq!(db._entry_count(), 4);
 
         db.clear_map(&view, MapId(7));
@@ -645,37 +645,37 @@ mod tests {
     #[test]
     fn relocalization_returns_only_target_map() {
         let voc = tiny_voc();
-        let db = KeyframeDatabase::new(voc.clone());
+        let db = KeyFrameDatabase::new(voc.clone());
         let mut view = MockView::default();
 
         // Three KFs, two in map 1, one in map 2. All share words with query.
         for &(id, m) in &[(1u64, 1u64), (2, 1), (3, 2)] {
             let b = bow(&[0, 1, 2, 3]);
             view.insert(
-                KeyframeId(id),
+                KeyFrameId(id),
                 MockKf {
                     bow: b.clone(),
                     map: MapId(m),
                     ..Default::default()
                 },
             );
-            db.add(KeyframeId(id), &b);
+            db.add(KeyFrameId(id), &b);
         }
         let query = bow(&[0, 1, 2, 3]);
         let cands = db.detect_relocalization_candidates(&view, &query, MapId(1));
         let set: HashSet<_> = cands.into_iter().collect();
-        assert!(set.contains(&KeyframeId(1)));
-        assert!(set.contains(&KeyframeId(2)));
-        assert!(!set.contains(&KeyframeId(3)));
+        assert!(set.contains(&KeyFrameId(1)));
+        assert!(set.contains(&KeyFrameId(2)));
+        assert!(!set.contains(&KeyFrameId(3)));
     }
 
     #[test]
     fn loop_detection_skips_connected_keyframes() {
         let voc = tiny_voc();
-        let db = KeyframeDatabase::new(voc);
+        let db = KeyFrameDatabase::new(voc);
         let mut view = MockView::default();
 
-        let q = KeyframeId(100);
+        let q = KeyFrameId(100);
         let b = bow(&[0, 1, 2, 3]);
 
         // Query
@@ -684,7 +684,7 @@ mod tests {
             MockKf {
                 bow: b.clone(),
                 map: MapId(1),
-                connected: [KeyframeId(2)].into_iter().collect(),
+                connected: [KeyFrameId(2)].into_iter().collect(),
                 ..Default::default()
             },
         );
@@ -693,29 +693,29 @@ mod tests {
         // Candidate 2: connected → must be excluded.
         for id in [1u64, 2] {
             view.insert(
-                KeyframeId(id),
+                KeyFrameId(id),
                 MockKf {
                     bow: b.clone(),
                     map: MapId(1),
                     ..Default::default()
                 },
             );
-            db.add(KeyframeId(id), &b);
+            db.add(KeyFrameId(id), &b);
         }
 
         let cands = db.detect_loop_candidates(&view, q, 0.0);
         let set: HashSet<_> = cands.into_iter().collect();
-        assert!(set.contains(&KeyframeId(1)));
-        assert!(!set.contains(&KeyframeId(2)));
+        assert!(set.contains(&KeyFrameId(1)));
+        assert!(!set.contains(&KeyFrameId(2)));
     }
 
     #[test]
     fn loop_and_merge_split_by_map() {
         let voc = tiny_voc();
-        let db = KeyframeDatabase::new(voc);
+        let db = KeyFrameDatabase::new(voc);
         let mut view = MockView::default();
 
-        let q = KeyframeId(100);
+        let q = KeyFrameId(100);
         let b = bow(&[0, 1, 2, 3]);
 
         view.insert(
@@ -731,33 +731,33 @@ mod tests {
         // KF 4 → different map but the map is bad → must be dropped.
         for &(id, m) in &[(1u64, 1u64), (2, 1), (3, 2), (4, 3)] {
             view.insert(
-                KeyframeId(id),
+                KeyFrameId(id),
                 MockKf {
                     bow: b.clone(),
                     map: MapId(m),
                     ..Default::default()
                 },
             );
-            db.add(KeyframeId(id), &b);
+            db.add(KeyFrameId(id), &b);
         }
         view.bad_maps.insert(MapId(3));
 
         let res = db.detect_loop_and_merge_candidates(&view, q, 0.0);
         let l: HashSet<_> = res.loop_.into_iter().collect();
         let m: HashSet<_> = res.merge.into_iter().collect();
-        assert!(l.contains(&KeyframeId(1)));
-        assert!(l.contains(&KeyframeId(2)));
-        assert!(m.contains(&KeyframeId(3)));
-        assert!(!m.contains(&KeyframeId(4)));
+        assert!(l.contains(&KeyFrameId(1)));
+        assert!(l.contains(&KeyFrameId(2)));
+        assert!(m.contains(&KeyFrameId(3)));
+        assert!(!m.contains(&KeyFrameId(4)));
     }
 
     #[test]
     fn n_best_caps_each_category_at_n_and_skips_bad() {
         let voc = tiny_voc();
-        let db = KeyframeDatabase::new(voc);
+        let db = KeyFrameDatabase::new(voc);
         let mut view = MockView::default();
 
-        let q = KeyframeId(100);
+        let q = KeyFrameId(100);
         let b = bow(&[0, 1, 2, 3]);
         view.insert(
             q,
@@ -780,7 +780,7 @@ mod tests {
             (8, 2, false),
         ] {
             view.insert(
-                KeyframeId(id),
+                KeyFrameId(id),
                 MockKf {
                     bow: b.clone(),
                     map: MapId(map),
@@ -788,14 +788,14 @@ mod tests {
                     ..Default::default()
                 },
             );
-            db.add(KeyframeId(id), &b);
+            db.add(KeyFrameId(id), &b);
         }
 
         let res = db.detect_n_best_candidates(&view, q, 2);
         assert!(res.loop_.len() <= 2);
         assert!(res.merge.len() <= 2);
-        assert!(!res.loop_.contains(&KeyframeId(3)), "bad KF leaked");
-        assert!(!res.merge.contains(&KeyframeId(6)), "bad KF leaked");
+        assert!(!res.loop_.contains(&KeyFrameId(3)), "bad KF leaked");
+        assert!(!res.merge.contains(&KeyFrameId(6)), "bad KF leaked");
         for kf in &res.loop_ {
             assert_eq!(view.map_id(*kf), Some(MapId(1)));
         }
@@ -807,27 +807,27 @@ mod tests {
     #[test]
     fn erase_then_detect_excludes_keyframe() {
         let voc = tiny_voc();
-        let db = KeyframeDatabase::new(voc);
+        let db = KeyFrameDatabase::new(voc);
         let mut view = MockView::default();
 
         let b = bow(&[0, 1, 2, 3]);
         for id in [1u64, 2] {
             view.insert(
-                KeyframeId(id),
+                KeyFrameId(id),
                 MockKf {
                     bow: b.clone(),
                     map: MapId(1),
                     ..Default::default()
                 },
             );
-            db.add(KeyframeId(id), &b);
+            db.add(KeyFrameId(id), &b);
         }
 
         let cands = db.detect_relocalization_candidates(&view, &b, MapId(1));
         assert_eq!(cands.len(), 2);
 
-        db.erase(KeyframeId(1), &b);
+        db.erase(KeyFrameId(1), &b);
         let cands = db.detect_relocalization_candidates(&view, &b, MapId(1));
-        assert_eq!(cands, vec![KeyframeId(2)]);
+        assert_eq!(cands, vec![KeyFrameId(2)]);
     }
 }

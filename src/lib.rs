@@ -1,6 +1,7 @@
 pub mod atlas;
 pub mod camera_models;
 pub mod geometric_tools;
+pub mod imu_types;
 pub mod keyframe;
 pub mod keyframe_database;
 pub mod map;

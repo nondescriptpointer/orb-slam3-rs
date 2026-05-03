@@ -7,7 +7,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -24,7 +23,7 @@ fn main() {
         return;
     }
 
-    if !needs_unpack(&archive, &target) {
+    if target.exists() {
         return;
     }
 
@@ -39,20 +38,6 @@ fn main() {
     }
 }
 
-fn needs_unpack(archive: &Path, target: &Path) -> bool {
-    let archive_mtime = mtime(archive);
-    let target_mtime = mtime(target);
-    match (archive_mtime, target_mtime) {
-        (Some(a), Some(t)) => a > t,
-        (Some(_), None) => true,
-        _ => false,
-    }
-}
-
-fn mtime(path: &Path) -> Option<SystemTime> {
-    fs::metadata(path).ok().and_then(|m| m.modified().ok())
-}
-
 fn unpack(archive: &Path, dest_dir: &Path) -> std::io::Result<()> {
     let f = fs::File::open(archive)?;
     let gz = flate2::read::GzDecoder::new(f);
@@ -64,7 +49,7 @@ fn unpack(archive: &Path, dest_dir: &Path) -> std::io::Result<()> {
     // for consistency.
     let upstream = dest_dir.join("ORBvoc.txt");
     let canonical = dest_dir.join("orbvoc.txt");
-    if upstream.exists() && !canonical.exists() {
+    if upstream.exists() {
         fs::rename(&upstream, &canonical)?;
     }
     Ok(())

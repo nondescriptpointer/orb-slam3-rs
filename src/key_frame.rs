@@ -1,17 +1,18 @@
 use nalgebra::{Isometry3, Matrix3, Vector3};
 use opencv::core::{KeyPoint, Mat};
+use std::sync::Arc;
 
 use crate::{
     imu_types::{Bias, Calib, Preintegrated},
     orb_vocabulary::{BowVector, FeatureVector},
 };
 
-pub struct KeyFrame<'a> {
+pub struct KeyFrame {
     pub imu: bool,
 
     pub next_id: u64,
     pub id: u64,
-    pub frame_id: u64,
+    pub frame_id: usize,
     pub timestamp: f64,
 
     // Grid (to speed up feature matching)
@@ -112,10 +113,10 @@ pub struct KeyFrame<'a> {
     pub max_y: u32,
 
     // Preintegrated IMU measurements from previous keyframes
-    pub prev_kf: &'a KeyFrame<'a>,
-    pub next_kf: &'a KeyFrame<'a>,
+    pub prev_kf: Arc<KeyFrame>,
+    pub next_kf: Arc<KeyFrame>,
 
-    pub imu_preintegrated: &'a Preintegrated,
+    pub imu_preintegrated: Arc<Preintegrated>,
     pub imu_calib: Calib,
 
     pub origin_map_id: u32,
@@ -124,8 +125,8 @@ pub struct KeyFrame<'a> {
 
     pub dataset: u32,
 
-    pub loop_cand_kfs: Vec<&'a KeyFrame<'a>>,
-    pub merge_cand_kfs: Vec<&'a KeyFrame<'a>>,
+    pub loop_cand_kfs: Vec<Arc<KeyFrame>>,
+    pub merge_cand_kfs: Vec<Arc<KeyFrame>>,
 
     // The following variables originally needed to be accessed through a mutex to be thread safe
     // TODO: figure out how to approach this
@@ -151,7 +152,7 @@ pub struct KeyFrame<'a> {
     // MapPoints associated to keypoints
     //
 
-    // HERE
+    // TODO: HERE
 }
 
-impl<'a> KeyFrame<'a> {}
+impl KeyFrame {}

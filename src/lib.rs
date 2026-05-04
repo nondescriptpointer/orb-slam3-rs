@@ -1,12 +1,16 @@
 pub mod atlas;
 pub mod camera_models;
+pub mod compat;
+pub mod frame;
 pub mod geometric_tools;
 pub mod imu_types;
 pub mod key_frame;
 pub mod key_frame_database;
 pub mod map;
 pub mod map_point;
+pub mod orb_extractor;
 pub mod orb_vocabulary;
+pub mod serialization_utils;
 pub mod settings;
 pub mod system;
 pub mod two_view_reconstruction;

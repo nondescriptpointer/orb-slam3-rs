@@ -17,10 +17,14 @@ but iteration and insertion are dramatically cheaper.
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+use serde::{Deserialize, Serialize};
+
 use crate::orb_vocabulary::{BowVector, OrbVocabulary};
 
 /// Stable identifier for a KeyFrame
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
 pub struct KeyFrameId(pub u64);
 
 /// Stable identifier for a map within the atlas

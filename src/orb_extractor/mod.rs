@@ -1,9 +1,9 @@
 mod brief_pattern;
 
 use opencv::core::{
-    _InputArrayTraitConst, BORDER_ISOLATED, BORDER_REFLECT_101, CV_8U, CV_8UC1, InputArray,
-    KeyPoint, KeyPointTrait, KeyPointTraitConst, Mat, MatTraitConst, Point2f, Point2i, Rect,
-    Scalar, Size, Vector, copy_make_border,
+    _InputArrayTraitConst, BORDER_ISOLATED, BORDER_REFLECT_101, CV_8U, CV_8UC1, KeyPoint,
+    KeyPointTrait, KeyPointTraitConst, Mat, MatTraitConst, Point2f, Point2i, Rect, Scalar, Size,
+    ToInputArray, Vector, copy_make_border,
 };
 use opencv::features2d::fast;
 use opencv::imgproc::{INTER_LINEAR, gaussian_blur, resize};
@@ -95,7 +95,7 @@ impl ExtractorNode {
 
 #[derive(Default)]
 pub struct OrbExtractor {
-    pub image_pyramid: Option<Vec<Mat>>,
+    pub image_pyramid: Vec<Mat>,
     features: usize,
     scale_factor: f64,
     levels: usize,
@@ -114,6 +114,7 @@ pub enum Score {
     Fast,
 }
 
+#[derive(Debug)]
 pub enum ExtractionError {
     EmptyImage,
     InvalidInput,
@@ -178,6 +179,11 @@ impl OrbExtractor {
             v0 += 1;
         }
 
+        // Pre-size the pyramid Vec with empty Mats so that the public field
+        // mirrors C++ `mvImagePyramid.resize(nlevels)` immediately after
+        // construction (used by callers and tests).
+        let image_pyramid: Vec<Mat> = (0..levels).map(|_| Mat::default()).collect();
+
         OrbExtractor {
             features,
             scale_factor: scale_factor as f64,
@@ -190,6 +196,7 @@ impl OrbExtractor {
             v_inv_level_sigma2,
             features_per_level,
             umax,
+            image_pyramid,
             ..Default::default()
         }
     }
@@ -205,15 +212,18 @@ impl OrbExtractor {
     /// The returned `mono_count` is the number of head (non-overlap) keypoints
     pub fn compute(
         &mut self,
-        image: InputArray,
-        _mask: InputArray,
+        image: &impl ToInputArray,
+        _mask: &impl ToInputArray,
         lapping_area: [i32; 2],
     ) -> Result<(Option<Mat>, Vec<KeyPoint>, i32), ExtractionError> {
-        if image.empty().unwrap_or(true) {
+        let image_ia = image
+            .input_array()
+            .map_err(|_| ExtractionError::InvalidInput)?;
+        if image_ia.empty().unwrap_or(true) {
             return Err(ExtractionError::EmptyImage);
         }
 
-        let image_mat = image
+        let image_mat = image_ia
             .get_mat_def()
             .map_err(|_| ExtractionError::InvalidInput)?;
         if image_mat.typ() != CV_8UC1 {
@@ -240,7 +250,7 @@ impl OrbExtractor {
         let default_kp = KeyPoint::default().expect("KeyPoint::default");
         let mut keypoints: Vec<KeyPoint> = vec![default_kp; n_keypoints as usize];
 
-        let image_pyramid = self.image_pyramid.as_ref().unwrap();
+        let image_pyramid = &self.image_pyramid;
         let lap_min = lapping_area[0] as f32;
         let lap_max = lapping_area[1] as f32;
 
@@ -369,12 +379,12 @@ impl OrbExtractor {
             .expect("create roi");
             pyramid.push(inner.try_clone().expect("clone mat"));
         }
-        self.image_pyramid = Some(pyramid);
+        self.image_pyramid = pyramid;
     }
 
     fn compute_keypoints_oct_tree(&self) -> Vec<Vec<KeyPoint>> {
         let mut all_keypoints: Vec<Vec<KeyPoint>> = Vec::with_capacity(self.levels);
-        let pyramid = self.image_pyramid.as_ref().unwrap();
+        let pyramid = &self.image_pyramid;
 
         let w = 35.;
 
@@ -772,4 +782,345 @@ fn compute_orb_descriptor(kpt: &KeyPoint, img: &Mat, desc: &mut [u8]) -> opencv:
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opencv::core::{KeyPoint, Mat, MatTraitConstManual, Scalar};
+
+    // Default parameters used across many tests
+    const N_FEATURES: usize = 1000;
+    const SCALE_FACTOR: f32 = 1.2;
+    const N_LEVELS: usize = 8;
+    const INI_TH_FAST: i32 = 20;
+    const MIN_TH_FAST: i32 = 7;
+
+    /// Synthetic 8-bit grayscale checkerboard with many corner-like features.
+    fn make_checkerboard(rows: i32, cols: i32, square: i32) -> Mat {
+        let mut img =
+            Mat::new_rows_cols_with_default(rows, cols, CV_8UC1, Scalar::all(0.0)).unwrap();
+        let stride = img.step1(0).unwrap() as usize;
+        let data = img.data_bytes_mut().unwrap();
+        for y in 0..rows {
+            for x in 0..cols {
+                let a = (x / square) & 1;
+                let b = (y / square) & 1;
+                let v: u8 = if (a ^ b) != 0 { 230 } else { 25 };
+                data[(y as usize) * stride + (x as usize)] = v;
+            }
+        }
+        img
+    }
+
+    fn make_uniform(rows: i32, cols: i32, v: u8) -> Mat {
+        Mat::new_rows_cols_with_default(rows, cols, CV_8UC1, Scalar::all(v as f64)).unwrap()
+    }
+
+    fn approx_eq(a: f32, b: f32) -> bool {
+        (a - b).abs() <= f32::max(a.abs(), b.abs()) * 1e-5 + 1e-6
+    }
+
+    // -----------------------------------------------------------------------
+    // Constructor / accessor tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn constructor_stores_basic_parameters() {
+        let ext = OrbExtractor::new(N_FEATURES, SCALE_FACTOR, N_LEVELS, INI_TH_FAST, MIN_TH_FAST);
+
+        assert_eq!(ext.get_levels(), N_LEVELS);
+        assert!(approx_eq(ext.get_scale_factor() as f32, SCALE_FACTOR));
+        assert_eq!(ext.get_scale_factors().len(), N_LEVELS);
+        assert_eq!(ext.get_inverse_scale_factors().len(), N_LEVELS);
+        assert_eq!(ext.get_scale_sigma2().len(), N_LEVELS);
+        assert_eq!(ext.get_inverse_scale_sigma2().len(), N_LEVELS);
+        assert_eq!(ext.image_pyramid.len(), N_LEVELS);
+    }
+
+    #[test]
+    fn scale_factor_sequence_is_geometric() {
+        let ext = OrbExtractor::new(N_FEATURES, SCALE_FACTOR, N_LEVELS, INI_TH_FAST, MIN_TH_FAST);
+
+        let sf = ext.get_scale_factors();
+        let isf = ext.get_inverse_scale_factors();
+        let s2 = ext.get_scale_sigma2();
+        let is2 = ext.get_inverse_scale_sigma2();
+
+        assert!(approx_eq(sf[0], 1.0));
+        assert!(approx_eq(isf[0], 1.0));
+        assert!(approx_eq(s2[0], 1.0));
+        assert!(approx_eq(is2[0], 1.0));
+
+        for i in 1..N_LEVELS {
+            assert!(approx_eq(sf[i], sf[i - 1] * SCALE_FACTOR));
+            assert!(approx_eq(isf[i], 1.0 / sf[i]));
+            assert!(approx_eq(s2[i], sf[i] * sf[i]));
+            assert!(approx_eq(is2[i], 1.0 / s2[i]));
+            assert!(sf[i] > sf[i - 1]); // strictly increasing
+            assert!(isf[i] < isf[i - 1]); // strictly decreasing
+        }
+    }
+
+    #[test]
+    fn scale_factor_sequence_with_unit_scale_is_constant() {
+        let ext = OrbExtractor::new(500, 1.0, 4, INI_TH_FAST, MIN_TH_FAST);
+        for &s in ext.get_scale_factors() {
+            assert!(approx_eq(s, 1.0));
+        }
+        for &s in ext.get_inverse_scale_factors() {
+            assert!(approx_eq(s, 1.0));
+        }
+    }
+
+    #[test]
+    fn constructor_with_single_level_works() {
+        let ext = OrbExtractor::new(500, 1.2, 1, INI_TH_FAST, MIN_TH_FAST);
+        assert_eq!(ext.get_levels(), 1);
+        assert_eq!(ext.get_scale_factors().len(), 1);
+        assert!(approx_eq(ext.get_scale_factors()[0], 1.0));
+        assert_eq!(ext.image_pyramid.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute() — edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_returns_err_for_empty_image() {
+        let mut ext =
+            OrbExtractor::new(N_FEATURES, SCALE_FACTOR, N_LEVELS, INI_TH_FAST, MIN_TH_FAST);
+        let empty = Mat::default();
+        let result = ext.compute(&empty, &Mat::default(), [0, 0]);
+        assert!(matches!(result, Err(ExtractionError::EmptyImage)));
+    }
+
+    #[test]
+    fn compute_uniform_image_yields_no_keypoints() {
+        let mut ext =
+            OrbExtractor::new(N_FEATURES, SCALE_FACTOR, N_LEVELS, INI_TH_FAST, MIN_TH_FAST);
+        let img = make_uniform(240, 320, 128);
+        let (desc, kpts, mono) = ext.compute(&img, &Mat::default(), [0, 0]).unwrap();
+        assert_eq!(mono, 0);
+        assert!(kpts.is_empty());
+        assert!(desc.is_none()); // C++: _descriptors.release()
+    }
+
+    // -----------------------------------------------------------------------
+    // compute() — happy path on a checkerboard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_extracts_keypoints_and_descriptors_on_textured_image() {
+        let mut ext =
+            OrbExtractor::new(N_FEATURES, SCALE_FACTOR, N_LEVELS, INI_TH_FAST, MIN_TH_FAST);
+        let img = make_checkerboard(480, 640, 20);
+
+        let (desc, kpts, mono) = ext.compute(&img, &Mat::default(), [0, 0]).unwrap();
+        assert!(mono > 0);
+        assert_eq!(mono as usize, kpts.len());
+
+        let desc = desc.expect("descriptors present");
+        assert_eq!(desc.rows(), kpts.len() as i32);
+        assert_eq!(desc.cols(), 32);
+        assert_eq!(desc.typ(), CV_8U);
+
+        for kp in &kpts {
+            let pt = kp.pt();
+            assert!(pt.x >= 0.0);
+            assert!(pt.y >= 0.0);
+            assert!(pt.x < img.cols() as f32);
+            assert!(pt.y < img.rows() as f32);
+            assert!(kp.octave() >= 0);
+            assert!(kp.octave() < N_LEVELS as i32);
+            assert!(kp.size() > 0.0);
+            assert!(kp.angle() >= 0.0);
+            assert!(kp.angle() < 360.0);
+        }
+    }
+
+    #[test]
+    fn compute_is_deterministic_for_same_input() {
+        let mut ext =
+            OrbExtractor::new(N_FEATURES, SCALE_FACTOR, N_LEVELS, INI_TH_FAST, MIN_TH_FAST);
+        let img = make_checkerboard(480, 640, 20);
+
+        let (desc1, kpts1, n1) = ext.compute(&img, &Mat::default(), [0, 0]).unwrap();
+        let (desc2, kpts2, n2) = ext.compute(&img, &Mat::default(), [0, 0]).unwrap();
+
+        assert_eq!(n1, n2);
+        assert_eq!(kpts1.len(), kpts2.len());
+        let desc1 = desc1.expect("descriptors 1");
+        let desc2 = desc2.expect("descriptors 2");
+        assert_eq!(desc1.rows(), desc2.rows());
+
+        for (a, b) in kpts1.iter().zip(kpts2.iter()) {
+            assert!(approx_eq(a.pt().x, b.pt().x));
+            assert!(approx_eq(a.pt().y, b.pt().y));
+            assert_eq!(a.octave(), b.octave());
+        }
+
+        // Descriptors bit-identical
+        let d1 = desc1.data_bytes().unwrap();
+        let d2 = desc2.data_bytes().unwrap();
+        assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn lower_fast_thresholds_yield_more_keypoints() {
+        let img = make_checkerboard(480, 640, 20);
+
+        let mut ext_high = OrbExtractor::new(N_FEATURES, SCALE_FACTOR, N_LEVELS, 40, 20);
+        let mut ext_low = OrbExtractor::new(N_FEATURES, SCALE_FACTOR, N_LEVELS, 7, 3);
+
+        let (_, k_high, _) = ext_high.compute(&img, &Mat::default(), [0, 0]).unwrap();
+        let (_, k_low, _) = ext_low.compute(&img, &Mat::default(), [0, 0]).unwrap();
+
+        assert!(k_low.len() >= k_high.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // Image pyramid
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pyramid_levels_have_correct_sizes() {
+        let mut ext =
+            OrbExtractor::new(N_FEATURES, SCALE_FACTOR, N_LEVELS, INI_TH_FAST, MIN_TH_FAST);
+        let img = make_checkerboard(480, 640, 20);
+        let _ = ext.compute(&img, &Mat::default(), [0, 0]).unwrap();
+
+        assert_eq!(ext.image_pyramid.len(), N_LEVELS);
+        let isf = ext.get_inverse_scale_factors().clone();
+
+        // Level 0 matches input image dimensions
+        assert_eq!(ext.image_pyramid[0].rows(), img.rows());
+        assert_eq!(ext.image_pyramid[0].cols(), img.cols());
+
+        for level in 0..N_LEVELS {
+            let m = &ext.image_pyramid[level];
+            assert!(!m.empty());
+            assert_eq!(m.typ(), CV_8UC1);
+
+            let exp_rows = cv_round_f32(img.rows() as f32 * isf[level]);
+            let exp_cols = cv_round_f32(img.cols() as f32 * isf[level]);
+            assert_eq!(m.rows(), exp_rows);
+            assert_eq!(m.cols(), exp_cols);
+
+            if level > 0 {
+                assert!(m.rows() <= ext.image_pyramid[level - 1].rows());
+                assert!(m.cols() <= ext.image_pyramid[level - 1].cols());
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Lapping area: stereo / mono split
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lapping_area_splits_keypoints_into_mono_and_stereo() {
+        let mut ext =
+            OrbExtractor::new(N_FEATURES, SCALE_FACTOR, N_LEVELS, INI_TH_FAST, MIN_TH_FAST);
+        let img = make_checkerboard(480, 640, 20);
+
+        // Right half is the "lapping" (stereo) area.
+        let lap = [img.cols() / 2, img.cols()];
+        let (_, kpts, mono) = ext.compute(&img, &Mat::default(), lap).unwrap();
+
+        assert!(mono >= 0);
+        assert!(mono <= kpts.len() as i32);
+        let total = kpts.len() as i32;
+        let stereo = total - mono;
+
+        // Both categories should be populated for a textured image.
+        assert!(mono > 0);
+        assert!(stereo > 0);
+
+        for kp in &kpts[..mono as usize] {
+            let x = kp.pt().x;
+            let inside = x >= lap[0] as f32 && x <= lap[1] as f32;
+            assert!(!inside, "mono keypoint inside lapping area: x={x}");
+        }
+        for kp in &kpts[mono as usize..] {
+            let x = kp.pt().x;
+            assert!(x >= lap[0] as f32);
+            assert!(x <= lap[1] as f32);
+        }
+    }
+
+    #[test]
+    fn lapping_area_covering_full_image_marks_every_keypoint_as_stereo() {
+        let mut ext =
+            OrbExtractor::new(N_FEATURES, SCALE_FACTOR, N_LEVELS, INI_TH_FAST, MIN_TH_FAST);
+        let img = make_checkerboard(240, 320, 20);
+
+        let lap = [0, img.cols()];
+        let (_, kpts, mono) = ext.compute(&img, &Mat::default(), lap).unwrap();
+        assert!(!kpts.is_empty());
+        assert_eq!(mono, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // ExtractorNode
+    // -----------------------------------------------------------------------
+
+    fn kp(x: f32, y: f32) -> KeyPoint {
+        KeyPoint::new_coords_def(x, y, 1.0).unwrap()
+    }
+
+    #[test]
+    fn divide_node_splits_region_into_four_quadrants() {
+        let mut node = ExtractorNode {
+            ul: Point2i::new(0, 0),
+            ur: Point2i::new(100, 0),
+            bl: Point2i::new(0, 80),
+            br: Point2i::new(100, 80),
+            ..Default::default()
+        };
+        // Sprinkle one keypoint into each quadrant.
+        node.keys.push(kp(10.0, 10.0)); // top-left
+        node.keys.push(kp(80.0, 10.0)); // top-right
+        node.keys.push(kp(10.0, 70.0)); // bottom-left
+        node.keys.push(kp(80.0, 70.0)); // bottom-right
+
+        let [n1, n2, n3, n4] = node.divide_node();
+
+        // Quadrants partition the bounding box.
+        assert_eq!(n1.ul, node.ul);
+        assert_eq!(n4.br, node.br);
+        assert_eq!(n1.ur.x, n2.ul.x);
+        assert_eq!(n1.bl.y, n3.ul.y);
+        assert_eq!(n2.br.x, node.ur.x);
+        assert_eq!(n3.br.y, node.br.y);
+
+        // All four keypoints are redistributed across the children.
+        let total = n1.keys.len() + n2.keys.len() + n3.keys.len() + n4.keys.len();
+        assert_eq!(total, 4);
+
+        // Each child with a single keypoint should set no_more == true.
+        for c in [&n1, &n2, &n3, &n4] {
+            if c.keys.len() == 1 {
+                assert!(c.no_more);
+            } else {
+                assert!(!c.no_more);
+            }
+        }
+    }
+
+    #[test]
+    fn divide_node_with_no_keypoints_leaves_children_empty() {
+        let node = ExtractorNode {
+            ul: Point2i::new(0, 0),
+            ur: Point2i::new(50, 0),
+            bl: Point2i::new(0, 40),
+            br: Point2i::new(50, 40),
+            ..Default::default()
+        };
+        let [n1, n2, n3, n4] = node.divide_node();
+        for c in [&n1, &n2, &n3, &n4] {
+            assert!(c.keys.is_empty());
+            assert!(!c.no_more);
+        }
+    }
 }

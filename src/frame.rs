@@ -1,6 +1,6 @@
 use nalgebra::{Isometry3, Matrix3, Vector3};
-use opencv::core::Point2f;
 use opencv::core::{KeyPoint, Mat};
+use opencv::core::{NORM_HAMMING, Point2f};
 use opencv::features2d::BFMatcher;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +21,26 @@ static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 static FRAME_GRID_ROWS: usize = 48;
 static FRAME_GRID_COLS: usize = 64;
 
+#[derive(Clone, Copy, Debug)]
+pub struct CameraIntrinsics {
+    pub fx: f32,
+    pub fy: f32,
+    pub cx: f32,
+    pub cy: f32,
+    pub invfx: f32,
+    pub invfy: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ImageBounds {
+    pub min_x: f32,
+    pub max_x: f32,
+    pub min_y: f32,
+    pub max_y: f32,
+    pub grid_w_inv: f32,
+    pub grid_h_inv: f32,
+}
+
 pub struct Frame {
     // Current Frame id
     pub id: usize,
@@ -38,12 +58,8 @@ pub struct Frame {
     // Calibration matrix and OpenCV distortion parameters
     pub k: Mat,
     pub k_matrix: Matrix3<f32>,
-    pub fx: f32,
-    pub fy: f32,
-    pub cx: f32,
-    pub cy: f32,
-    pub inv_fx: f32,
-    pub inv_fy: f32,
+    pub intrinsics: Arc<CameraIntrinsics>,
+    pub bounds: Arc<ImageBounds>,
     pub dist_coef: Mat,
 
     // Stereo baseline multiplied by fx
@@ -86,8 +102,6 @@ pub struct Frame {
     pub close_mps: usize,
 
     // Keypoints are assigned to cells in a grid to reduce matching complexity when projecting MapPoints
-    pub grid_element_width_inv: f32,
-    pub grid_element_height_inv: f32,
     pub grid: Vec<Vec<usize>>,
 
     // Prediction bias
@@ -119,14 +133,6 @@ pub struct Frame {
     pub level_sigma2: Vec<f32>,
     pub inv_level_sigma2: Vec<f32>,
 
-    // Undistorted Image Bounds (computed once)
-    pub min_x: f32,
-    pub max_x: f32,
-    pub min_y: f32,
-    pub max_y: f32,
-
-    pub initial_computations: bool,
-
     pub project_ponts: HashMap<usize, Point2f>,
     pub matched_in_image: HashMap<usize, Point2f>,
 
@@ -146,9 +152,6 @@ pub struct Frame {
     // For stereo matching
     pub left_to_right_match: Vec<usize>,
     pub right_to_left_match: Vec<usize>,
-
-    // For stereo fisheye matching
-    pub bf_matcher: BFMatcher,
 
     // Triangulated stereo observations using as reference the left camera.
     // These are computed during compute_stereo_fish_eye_matches
@@ -185,7 +188,7 @@ pub struct Frame {
 }
 
 impl Frame {
-    /*fn from_frame(frame: &Frame) -> Self {
-        Frame { id: frame.id }
-    }*/
+    fn bf_matcher() -> BFMatcher {
+        BFMatcher::new(NORM_HAMMING, false).unwrap()
+    }
 }

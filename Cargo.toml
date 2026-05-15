@@ -17,3 +17,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 [build-dependencies]
 flate2 = "1.0"
 tar = "0.4"
+
+[features]
+default = []
+register-times = []

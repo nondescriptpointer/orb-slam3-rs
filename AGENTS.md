@@ -19,9 +19,6 @@ cargo run --bin stereo_inertial_euroc -- \
     --vocabulary vocabulary/orbvoc.txt \
     --settings config/euroc.yaml \
     --sequence recording/euroc/mav0
-
-# Unpack the ORB vocabulary before first use
-tar -xzf vocabulary/orbvoc.txt.tar.gz -C vocabulary/
 ```
 
 ---
@@ -166,7 +163,6 @@ Wildcard imports (`use module::*`) are acceptable only when importing a prelude
 
 - Use `nalgebra` types for linear algebra: `Matrix3<f32>`, `SMatrix<f32, 3, 4>`,
   `Vector3<f32>`, `SVD`, etc.
-- Use `sophus` for Lie group / manifold representations (SO3, SE3).
 - Use `opencv` types for image data and YAML config I/O.
 - Prefer `f32` for performance-critical vision math (matching the OpenCV/ORB-SLAM3
   convention). Use `f64` only when numerical precision demands it.
@@ -212,20 +208,12 @@ Wildcard imports (`use module::*`) are acceptable only when importing a prelude
 - `nalgebra` for linear algebra.
 - `opencv` for image processing and YAML I/O.
 - `rand` for random sampling (RANSAC).
-- `sophus` with `features = ["std"]` for Lie groups.
 - `tracing` + `tracing-subscriber` for logging.
-
-Future: a `simd` feature flag will enable nightly-only SIMD optimizations via
-`sophus`. New optional functionality should be gated behind Cargo features.
 
 ---
 
 ## Key Invariants
 
-- The ORB vocabulary file (`vocabulary/orbvoc.txt`) is **not** tracked by git.
-  Unpack it with `tar -xzf vocabulary/orbvoc.txt.tar.gz -C vocabulary/` before
-  running the binary.
+- The ORB vocabulary file (`vocabulary/orbvoc.txt`) is **not** tracked by git. There is a build script to handle it.
 - Recording data (`recording/`) is gitignored; download the EuRoC dataset
   separately.
-- No `build.rs` exists yet; vocabulary unpacking is a manual step (tracked in
-  `notes.txt` as a TODO).

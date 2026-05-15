@@ -304,7 +304,7 @@ impl OrbExtractor {
     }
 
     fn compute_pyramid(&mut self, image: Mat) {
-        let mut pyramid = Vec::with_capacity(self.levels);
+        let mut pyramid: Vec<Mat> = Vec::with_capacity(self.levels);
         for level in 0..self.levels {
             let scale = self.v_inv_scale_factor[level];
             let size = Size::new(
@@ -315,33 +315,18 @@ impl OrbExtractor {
                 size.width + EDGE_THRESHOLD * 2,
                 size.height + EDGE_THRESHOLD * 2,
             );
+
+            // In C++ `mvImagePyramid[level]` aliases a ROI of `temp`, so
+            // `copyMakeBorder(temp, ...)` fills both the borders and (via the
+            // earlier resize) the inner region in a single buffer. We can't
+            // alias in Rust, so build `temp` first (resize into a scratch
+            // buffer, then bake the borders into `temp`) and clone the inner
+            // ROI for the pyramid. The keypoint/descriptor code only reads
+            // pixels inside the inner image, so the border padding is
+            // semantically a no-op for downstream consumers.
             let mut temp = Mat::new_size_with_default(whole_size, image.typ(), Scalar::all(0.))
                 .expect("allocate mat");
-            let roi = Mat::roi(
-                &temp,
-                Rect::new(EDGE_THRESHOLD, EDGE_THRESHOLD, size.width, size.height),
-            )
-            .expect("create roi");
-            pyramid.push(roi.try_clone().expect("clone mat"));
-
-            // Compute the resized image
-            if level != 0 {
-                let (prev_levels, current_and_after) = pyramid.split_at_mut(level);
-                let prev = &prev_levels[level - 1];
-                let current = &mut current_and_after[0];
-                resize(prev, current, size, 0., 0., INTER_LINEAR).expect("resize image");
-                copy_make_border(
-                    &pyramid[level],
-                    &mut temp,
-                    EDGE_THRESHOLD,
-                    EDGE_THRESHOLD,
-                    EDGE_THRESHOLD,
-                    EDGE_THRESHOLD,
-                    BORDER_REFLECT_101 + BORDER_ISOLATED,
-                    Scalar::default(),
-                )
-                .expect("copy make border");
-            } else {
+            if level == 0 {
                 copy_make_border(
                     &image,
                     &mut temp,
@@ -353,7 +338,36 @@ impl OrbExtractor {
                     Scalar::default(),
                 )
                 .expect("copy make border");
+            } else {
+                let mut resized = Mat::default();
+                resize(
+                    &pyramid[level - 1],
+                    &mut resized,
+                    size,
+                    0.,
+                    0.,
+                    INTER_LINEAR,
+                )
+                .expect("resize image");
+                copy_make_border(
+                    &resized,
+                    &mut temp,
+                    EDGE_THRESHOLD,
+                    EDGE_THRESHOLD,
+                    EDGE_THRESHOLD,
+                    EDGE_THRESHOLD,
+                    BORDER_REFLECT_101 + BORDER_ISOLATED,
+                    Scalar::default(),
+                )
+                .expect("copy make border");
             }
+
+            let inner = Mat::roi(
+                &temp,
+                Rect::new(EDGE_THRESHOLD, EDGE_THRESHOLD, size.width, size.height),
+            )
+            .expect("create roi");
+            pyramid.push(inner.try_clone().expect("clone mat"));
         }
         self.image_pyramid = Some(pyramid);
     }
@@ -391,7 +405,7 @@ impl OrbExtractor {
                 }
 
                 for j in 0..cols {
-                    let ini_x = min_border_x as f32 + j as f32 + w_cell;
+                    let ini_x = min_border_x as f32 + j as f32 * w_cell;
                     let mut max_x = ini_x + w_cell + 6.0;
                     if ini_x >= (max_border_x - 6) as f32 {
                         continue;
@@ -452,7 +466,7 @@ impl OrbExtractor {
             // Compute orientation
             compute_orientation(&pyramid[level], &mut keypoints, &self.umax);
 
-            all_keypoints[level] = keypoints;
+            all_keypoints.push(keypoints);
         }
 
         all_keypoints
@@ -479,7 +493,7 @@ impl OrbExtractor {
 }
 
 fn distribute_oct_tree(
-    to_distribute_keys: &Vec<KeyPoint>,
+    to_distribute_keys: &[KeyPoint],
     min_x: i32,
     max_x: i32,
     min_y: i32,
@@ -506,7 +520,9 @@ fn distribute_oct_tree(
         });
     }
 
-    // Associate points to childs
+    // Associate points to childs. C++ indexes `vpIniNodes[kp.pt.x/hX]`
+    // unconditionally; clamp here defensively because FAST keypoints can land
+    // a few pixels past the cell right edge (cells extend by +6 px).
     for kp in to_distribute_keys {
         let pt = kp.pt();
         let idx = (pt.x / h_x).floor() as usize;
@@ -524,59 +540,105 @@ fn distribute_oct_tree(
         _ => true,
     });
 
-    let mut finish = false;
-
-    while !finish {
+    loop {
         let prev_size = nodes.len();
 
+        // Full-subdivision pass: every non-`no_more` node is split into 4.
         let old_nodes = std::mem::take(&mut nodes);
         let mut new_nodes: Vec<ExtractorNode> = Vec::with_capacity(old_nodes.len() * 4);
-        let mut expandable_children = 0usize;
+        // Indices (into `new_nodes`) of children produced in this pass that
+        // have more than one keypoint and could still be subdivided. These
+        // form the "frontier" used by the overshoot branch below.
+        let mut frontier: Vec<usize> = Vec::new();
+        let mut n_to_expand: usize = 0;
 
         for node in old_nodes {
-            // If node only contains one point do not subdivide and continue
             if node.no_more {
                 new_nodes.push(node);
                 continue;
             }
-            // If more than one point, subdivide
             for child in node.divide_node() {
                 if child.keys.is_empty() {
                     continue;
                 }
-                if child.keys.len() > 1 {
-                    expandable_children += 1;
-                }
+                let expandable = child.keys.len() > 1;
+                let idx = new_nodes.len();
                 new_nodes.push(child);
+                if expandable {
+                    n_to_expand += 1;
+                    frontier.push(idx);
+                }
             }
         }
 
         nodes = new_nodes;
 
-        if nodes.len() > 0 || nodes.len() == prev_size {
-            finish = true;
-        } else if nodes.len() + expandable_children * 3 > n {
+        if nodes.len() >= n || nodes.len() == prev_size {
+            break;
+        }
+
+        if nodes.len() + n_to_expand * 3 > n {
+            // Overshoot branch: instead of another full subdivision (which
+            // would push us well past `n` nodes), subdivide the frontier
+            // selectively, largest-first, breaking ties by larger `ul.x`
+            // first. This matches the `compareNodes` ordering in C++:
+            //   sort ascending by (size, ul.x), then iterate from the back.
             loop {
-                let prev_size = nodes.len();
-                let Some((idx, _)) = nodes
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, node)| !node.no_more && node.keys.len() > 1)
-                    .max_by_key(|(_, node)| node.keys.len())
-                else {
-                    break;
-                };
-                let node = nodes.swap_remove(idx);
-                for child in node.divide_node() {
-                    if !child.keys.is_empty() {
-                        nodes.push(child);
+                let prev_size_inner = nodes.len();
+                frontier.sort_by_key(|&i| (nodes[i].keys.len(), nodes[i].ul.x));
+
+                // Replace `nodes` with an `Option`-wrapped vec so we can
+                // remove arbitrary indices without shifting positions.
+                let mut slots: Vec<Option<ExtractorNode>> = nodes.drain(..).map(Some).collect();
+                let mut new_children: Vec<ExtractorNode> = Vec::new();
+                // Indices (into `new_children`) of grandchildren that are
+                // themselves expandable; these become the next frontier.
+                let mut next_frontier_local: Vec<usize> = Vec::new();
+                let mut current_count = slots.len();
+
+                for &i in frontier.iter().rev() {
+                    let node = slots[i]
+                        .take()
+                        .expect("frontier index must point at a live node");
+                    current_count -= 1;
+                    for child in node.divide_node() {
+                        if child.keys.is_empty() {
+                            continue;
+                        }
+                        let expandable = child.keys.len() > 1;
+                        let local = new_children.len();
+                        new_children.push(child);
+                        current_count += 1;
+                        if expandable {
+                            next_frontier_local.push(local);
+                        }
+                    }
+                    if current_count >= n {
+                        break;
                     }
                 }
-                if nodes.len() >= n || nodes.len() == prev_size {
+
+                // Compact survivors, then append the new children.
+                let mut rebuilt: Vec<ExtractorNode> = Vec::with_capacity(current_count);
+                for slot in slots {
+                    if let Some(node) = slot {
+                        rebuilt.push(node);
+                    }
+                }
+                let survivors = rebuilt.len();
+                rebuilt.extend(new_children);
+
+                frontier = next_frontier_local
+                    .into_iter()
+                    .map(|local| survivors + local)
+                    .collect();
+                nodes = rebuilt;
+
+                if nodes.len() >= n || nodes.len() == prev_size_inner || frontier.is_empty() {
                     break;
                 }
             }
-            finish = true;
+            break;
         }
     }
 
@@ -594,7 +656,7 @@ fn distribute_oct_tree(
     result_keys
 }
 
-fn compute_orientation(image: &Mat, keypoints: &mut Vec<KeyPoint>, umax: &Vec<i32>) {
+fn compute_orientation(image: &Mat, keypoints: &mut [KeyPoint], umax: &[i32]) {
     for kp in keypoints {
         kp.set_angle(ic_angle(image, kp.pt(), umax).expect("compute orientation"));
     }

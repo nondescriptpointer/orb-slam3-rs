@@ -19,9 +19,6 @@ pub struct BriefPair {
 /// Number of bit-tests in one descriptor (32-byte descriptor).
 pub const BRIEF_PATTERN_LEN: usize = 256;
 
-/// Half-width of the patch the offsets are valid for. Patch is 31×31.
-pub const PATCH_HALF_SIZE: i32 = 15;
-
 /// Raw `(x1, y1, x2, y2)` quadruples, stored densely so the source is easy to diff against the upstream C++ table
 #[rustfmt::skip]
 const RAW: [i8; BRIEF_PATTERN_LEN * 4] = [

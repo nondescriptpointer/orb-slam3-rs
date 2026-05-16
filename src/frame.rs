@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use crate::camera_models::GeometricCamera;
+use crate::g2o_types::ConstraintPoseIMU;
 use crate::imu_types::Bias;
 use crate::imu_types::Calib;
 use crate::imu_types::Preintegrated;
@@ -41,12 +42,13 @@ pub struct ImageBounds {
     pub grid_h_inv: f32,
 }
 
+#[derive(Clone)]
 pub struct Frame {
     // Current Frame id
     pub id: usize,
 
     // Vocabulary used for relocalization
-    pub vocabulary: Arc<OrbVocabulary>,
+    pub orb_vocabulary: Arc<OrbVocabulary>,
 
     // Feature extractor. The right is used only in the stereo case.
     pub extractor_left: Arc<OrbExtractor>,
@@ -165,6 +167,8 @@ pub struct Frame {
     #[cfg(feature = "register-times")]
     pub time_stereo_match: f64,
 
+    cpi: Option<ConstraintPoseIMU>,
+
     // nalgebra migration
     t_cw: Isometry3<f32>,
     r_wc: Matrix3<f32>,
@@ -188,6 +192,32 @@ pub struct Frame {
 }
 
 impl Frame {
+    /*fn from_stereo_cameras(
+        im_left: &Mat,
+        im_right: &Mat,
+        timestamp: f64,
+        extractor_left: Arc<OrbExtractor>,
+        extractor_right: Arc<OrbExtractor>,
+        orb_vocabulary: Arc<OrbVocabulary>,
+        k: &Mat,
+        dist_coef: &Mat,
+        bf: f32,
+        th_depth: f32,
+        camera: &dyn GeometricCamera,
+        prev_f: &Frame,
+        imu_calib: &Calib,
+    ) -> Self {
+        // let k_matrix = // TODO: USE CONVERTER
+        Frame {
+            orb_vocabulary,
+            extractor_left,
+            extractor_right,
+            timestamp,
+            k: k.clone(),
+            cpi: None,
+        }
+    }*/
+
     fn bf_matcher() -> BFMatcher {
         BFMatcher::new(NORM_HAMMING, false).unwrap()
     }

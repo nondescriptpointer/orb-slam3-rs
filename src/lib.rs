@@ -1,7 +1,9 @@
 pub mod atlas;
 pub mod camera_models;
 pub mod compat;
+pub mod converter;
 pub mod frame;
+pub mod g2o_types;
 pub mod geometric_tools;
 pub mod imu_types;
 pub mod key_frame;

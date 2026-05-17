@@ -194,5 +194,10 @@ impl MapPoint {
         Mat::default()
     }
 
+    pub fn observations(&self) -> i32 {
+        // TODO
+        0
+    }
+
     // TODO: HERE
 }

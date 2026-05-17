@@ -31,6 +31,8 @@ pub struct MapPoint {
     #[serde(skip)]
     pub track_proj_z: f32,
     #[serde(skip)]
+    pub track_depth: f32,
+    #[serde(skip)]
     pub track_depth_r: f32,
     #[serde(skip)]
     pub track_proj_xr: f32,
@@ -180,6 +182,16 @@ impl MapPoint {
             world_pos: pos.clone(),
             ..Default::default()
         }
+    }
+
+    pub fn is_bad(&self) -> bool {
+        // TODO
+        false
+    }
+
+    pub fn get_descriptor(&self) -> Mat {
+        // TODO
+        Mat::default()
     }
 
     // TODO: HERE

@@ -27,167 +27,6 @@ static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 pub const FRAME_GRID_ROWS: usize = 48;
 pub const FRAME_GRID_COLS: usize = 64;
 
-#[derive(Clone, Copy, Debug)]
-pub struct CameraIntrinsics {
-    pub fx: f32,
-    pub fy: f32,
-    pub cx: f32,
-    pub cy: f32,
-    pub invfx: f32,
-    pub invfy: f32,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct ImageBounds {
-    pub min_x: f32,
-    pub max_x: f32,
-    pub min_y: f32,
-    pub max_y: f32,
-    pub grid_w_inv: f32,
-    pub grid_h_inv: f32,
-}
-
-/// Per-camera precomputed constants shared by every Frame produced from
-/// the same calibration.
-#[derive(Debug)]
-pub struct FrameConstants {
-    /// 3×3 intrinsics matrix as an OpenCV `Mat` (`CV_32F`).
-    pub k: Mat,
-    /// 3×3 intrinsics matrix as a nalgebra type.
-    pub k_matrix: Matrix3<f32>,
-    /// OpenCV distortion coefficients (may be empty / all-zero for fisheye).
-    pub dist_coef: Mat,
-    /// Scalar intrinsics derived from `k`.
-    pub intrinsics: CameraIntrinsics,
-    /// Undistorted image bounds and grid-cell inverse sizes.
-    pub bounds: ImageBounds,
-}
-
-#[derive(Debug)]
-pub enum FrameConstantsError {
-    /// `k` could not be converted to a `Matrix3<f32>`.
-    InvalidK(opencv::Error),
-    /// Undistortion of the image corners failed.
-    Undistort(opencv::Error),
-    /// Image dimensions must be strictly positive.
-    InvalidImageSize { cols: i32, rows: i32 },
-}
-impl std::fmt::Display for FrameConstantsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidK(e) => write!(f, "invalid camera matrix K: {e}"),
-            Self::Undistort(e) => write!(f, "failed to undistort image corners: {e}"),
-            Self::InvalidImageSize { cols, rows } => {
-                write!(f, "invalid image size: {cols}x{rows}")
-            }
-        }
-    }
-}
-impl std::error::Error for FrameConstantsError {}
-
-impl FrameConstants {
-    /// Build the per-camera constants from the calibration and the image size.
-    ///
-    /// This performs all the work the original C++ code did once inside the
-    /// `if(mbInitialComputations)` block of every `Frame` constructor.
-    ///
-    /// `k` is the 3×3 intrinsics matrix (`CV_32F`). `dist_coef` is the OpenCV
-    /// distortion-coefficient vector; pass an empty `Mat` (or one whose first
-    /// element is zero) for cameras that don't use OpenCV-style distortion
-    /// (e.g. fisheye/Kannala–Brandt), in which case the raw image rectangle is
-    /// used as the bounds — matching the C++ behaviour.
-    pub fn new(
-        k: Mat,
-        dist_coef: Mat,
-        image_cols: i32,
-        image_rows: i32,
-    ) -> Result<Self, FrameConstantsError> {
-        if image_cols <= 0 || image_rows <= 0 {
-            return Err(FrameConstantsError::InvalidImageSize {
-                cols: image_cols,
-                rows: image_rows,
-            });
-        }
-
-        let k_matrix = mat_to_matrix3f(&k).map_err(FrameConstantsError::InvalidK)?;
-        let fx = k_matrix[(0, 0)];
-        let fy = k_matrix[(1, 1)];
-        let cx = k_matrix[(0, 2)];
-        let cy = k_matrix[(1, 2)];
-        let intrinsics = CameraIntrinsics {
-            fx,
-            fy,
-            cx,
-            cy,
-            invfx: 1.0 / fx,
-            invfy: 1.0 / fy,
-        };
-
-        let (min_x, max_x, min_y, max_y) =
-            compute_image_bounds(&k, &dist_coef, image_cols, image_rows)?;
-        let bounds = ImageBounds {
-            min_x,
-            max_x,
-            min_y,
-            max_y,
-            grid_w_inv: FRAME_GRID_COLS as f32 / (max_x - min_x),
-            grid_h_inv: FRAME_GRID_ROWS as f32 / (max_y - min_y),
-        };
-
-        Ok(Self {
-            k,
-            k_matrix,
-            dist_coef,
-            intrinsics,
-            bounds,
-        })
-    }
-}
-
-fn compute_image_bounds(
-    k: &Mat,
-    dist_coef: &Mat,
-    image_cols: i32,
-    image_rows: i32,
-) -> Result<(f32, f32, f32, f32), FrameConstantsError> {
-    let has_distortion =
-        !dist_coef.empty() && dist_coef.at::<f32>(0).map(|v| *v != 0.0).unwrap_or(false);
-
-    if !has_distortion {
-        return Ok((0.0, image_cols as f32, 0.0, image_rows as f32));
-    }
-
-    // 4×1 of CV_32FC2 — the format `undistortPoints` expects.
-    let cols = image_cols as f32;
-    let rows = image_rows as f32;
-    let corners = Mat::from_slice_2d(&[
-        [Point2f::new(0.0, 0.0)],
-        [Point2f::new(cols, 0.0)],
-        [Point2f::new(0.0, rows)],
-        [Point2f::new(cols, rows)],
-    ])
-    .map_err(FrameConstantsError::Undistort)?;
-
-    let mut undistorted = Mat::default();
-    undistort_points(&corners, &mut undistorted, k, dist_coef, &Mat::default(), k)
-        .map_err(FrameConstantsError::Undistort)?;
-
-    let p = |i: i32| -> Result<Point2f, FrameConstantsError> {
-        undistorted
-            .at::<Point2f>(i)
-            .copied()
-            .map_err(FrameConstantsError::Undistort)
-    };
-    let (p0, p1, p2, p3) = (p(0)?, p(1)?, p(2)?, p(3)?);
-
-    Ok((
-        p0.x.min(p2.x),
-        p1.x.max(p3.x),
-        p0.y.min(p1.y),
-        p2.y.max(p3.y),
-    ))
-}
-
 #[derive(Clone)]
 pub struct Frame {
     // Current Frame id
@@ -483,9 +322,183 @@ impl Frame {
         }
     }
 
-    fn bf_matcher() -> BFMatcher {
-        BFMatcher::new(NORM_HAMMING, false).unwrap()
+    pub fn get_features_in_area(
+        &self,
+        x: f32,
+        y: f32,
+        r: f32,
+        min_level: i32,
+        max_level: i32,
+        right: bool,
+    ) -> Vec<usize> {
+        // TODO
+        Vec::new()
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CameraIntrinsics {
+    pub fx: f32,
+    pub fy: f32,
+    pub cx: f32,
+    pub cy: f32,
+    pub invfx: f32,
+    pub invfy: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ImageBounds {
+    pub min_x: f32,
+    pub max_x: f32,
+    pub min_y: f32,
+    pub max_y: f32,
+    pub grid_w_inv: f32,
+    pub grid_h_inv: f32,
+}
+
+/// Per-camera precomputed constants shared by every Frame produced from
+/// the same calibration.
+#[derive(Debug)]
+pub struct FrameConstants {
+    /// 3×3 intrinsics matrix as an OpenCV `Mat` (`CV_32F`).
+    pub k: Mat,
+    /// 3×3 intrinsics matrix as a nalgebra type.
+    pub k_matrix: Matrix3<f32>,
+    /// OpenCV distortion coefficients (may be empty / all-zero for fisheye).
+    pub dist_coef: Mat,
+    /// Scalar intrinsics derived from `k`.
+    pub intrinsics: CameraIntrinsics,
+    /// Undistorted image bounds and grid-cell inverse sizes.
+    pub bounds: ImageBounds,
+}
+
+#[derive(Debug)]
+pub enum FrameConstantsError {
+    /// `k` could not be converted to a `Matrix3<f32>`.
+    InvalidK(opencv::Error),
+    /// Undistortion of the image corners failed.
+    Undistort(opencv::Error),
+    /// Image dimensions must be strictly positive.
+    InvalidImageSize { cols: i32, rows: i32 },
+}
+impl std::fmt::Display for FrameConstantsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidK(e) => write!(f, "invalid camera matrix K: {e}"),
+            Self::Undistort(e) => write!(f, "failed to undistort image corners: {e}"),
+            Self::InvalidImageSize { cols, rows } => {
+                write!(f, "invalid image size: {cols}x{rows}")
+            }
+        }
+    }
+}
+impl std::error::Error for FrameConstantsError {}
+
+impl FrameConstants {
+    /// Build the per-camera constants from the calibration and the image size.
+    ///
+    /// This performs all the work the original C++ code did once inside the
+    /// `if(mbInitialComputations)` block of every `Frame` constructor.
+    ///
+    /// `k` is the 3×3 intrinsics matrix (`CV_32F`). `dist_coef` is the OpenCV
+    /// distortion-coefficient vector; pass an empty `Mat` (or one whose first
+    /// element is zero) for cameras that don't use OpenCV-style distortion
+    /// (e.g. fisheye/Kannala–Brandt), in which case the raw image rectangle is
+    /// used as the bounds — matching the C++ behaviour.
+    pub fn new(
+        k: Mat,
+        dist_coef: Mat,
+        image_cols: i32,
+        image_rows: i32,
+    ) -> Result<Self, FrameConstantsError> {
+        if image_cols <= 0 || image_rows <= 0 {
+            return Err(FrameConstantsError::InvalidImageSize {
+                cols: image_cols,
+                rows: image_rows,
+            });
+        }
+
+        let k_matrix = mat_to_matrix3f(&k).map_err(FrameConstantsError::InvalidK)?;
+        let fx = k_matrix[(0, 0)];
+        let fy = k_matrix[(1, 1)];
+        let cx = k_matrix[(0, 2)];
+        let cy = k_matrix[(1, 2)];
+        let intrinsics = CameraIntrinsics {
+            fx,
+            fy,
+            cx,
+            cy,
+            invfx: 1.0 / fx,
+            invfy: 1.0 / fy,
+        };
+
+        let (min_x, max_x, min_y, max_y) =
+            compute_image_bounds(&k, &dist_coef, image_cols, image_rows)?;
+        let bounds = ImageBounds {
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            grid_w_inv: FRAME_GRID_COLS as f32 / (max_x - min_x),
+            grid_h_inv: FRAME_GRID_ROWS as f32 / (max_y - min_y),
+        };
+
+        Ok(Self {
+            k,
+            k_matrix,
+            dist_coef,
+            intrinsics,
+            bounds,
+        })
+    }
+}
+
+fn compute_image_bounds(
+    k: &Mat,
+    dist_coef: &Mat,
+    image_cols: i32,
+    image_rows: i32,
+) -> Result<(f32, f32, f32, f32), FrameConstantsError> {
+    let has_distortion =
+        !dist_coef.empty() && dist_coef.at::<f32>(0).map(|v| *v != 0.0).unwrap_or(false);
+
+    if !has_distortion {
+        return Ok((0.0, image_cols as f32, 0.0, image_rows as f32));
+    }
+
+    // 4×1 of CV_32FC2 — the format `undistortPoints` expects.
+    let cols = image_cols as f32;
+    let rows = image_rows as f32;
+    let corners = Mat::from_slice_2d(&[
+        [Point2f::new(0.0, 0.0)],
+        [Point2f::new(cols, 0.0)],
+        [Point2f::new(0.0, rows)],
+        [Point2f::new(cols, rows)],
+    ])
+    .map_err(FrameConstantsError::Undistort)?;
+
+    let mut undistorted = Mat::default();
+    undistort_points(&corners, &mut undistorted, k, dist_coef, &Mat::default(), k)
+        .map_err(FrameConstantsError::Undistort)?;
+
+    let p = |i: i32| -> Result<Point2f, FrameConstantsError> {
+        undistorted
+            .at::<Point2f>(i)
+            .copied()
+            .map_err(FrameConstantsError::Undistort)
+    };
+    let (p0, p1, p2, p3) = (p(0)?, p(1)?, p(2)?, p(3)?);
+
+    Ok((
+        p0.x.min(p2.x),
+        p1.x.max(p3.x),
+        p0.y.min(p1.y),
+        p2.y.max(p3.y),
+    ))
+}
+
+fn bf_matcher() -> BFMatcher {
+    BFMatcher::new(NORM_HAMMING, false).unwrap()
 }
 
 /// Run ORB extraction on a single image

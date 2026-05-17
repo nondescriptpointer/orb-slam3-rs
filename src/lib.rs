@@ -11,6 +11,7 @@ pub mod key_frame_database;
 pub mod map;
 pub mod map_point;
 pub mod orb_extractor;
+pub mod orb_matcher;
 pub mod orb_vocabulary;
 pub mod serialization_utils;
 pub mod settings;

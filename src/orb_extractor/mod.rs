@@ -124,9 +124,6 @@ pub struct OrbExtractResult {
     pub descriptors: Option<Mat>,
     pub keypoints: Vec<KeyPoint>,
     pub mono_index: i32,
-    /// Gaussian scale pyramid that was used to extract `keypoints`.
-    /// Returned by value so `compute` can be called through `&self`
-    /// (and therefore through `Arc<OrbExtractor>`).
     pub image_pyramid: Vec<Mat>,
 }
 

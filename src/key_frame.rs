@@ -1,16 +1,17 @@
 use nalgebra::{Isometry3, Matrix3, Vector3};
 use opencv::core::{KeyPoint, Mat};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicUsize};
 
 use crate::{
     imu_types::{Bias, Calib, Preintegrated},
     orb_vocabulary::{BowVector, FeatureVector},
 };
 
+static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
 pub struct KeyFrame {
     pub imu: bool,
 
-    pub next_id: u64,
     pub id: u64,
     pub frame_id: usize,
     pub timestamp: f64,

@@ -19,8 +19,6 @@ static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 #[derive(Serialize, Deserialize, Default)]
 pub struct MapPoint {
     pub id: usize,
-    #[serde(skip)]
-    pub next_id: u64,
     pub first_kf_id: Option<u64>,
     pub first_frame: usize,
     pub obs: i32,

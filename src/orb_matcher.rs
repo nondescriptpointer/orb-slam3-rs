@@ -1,7 +1,9 @@
 use opencv::prelude::*;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::frame::Frame;
+use crate::key_frame::KeyFrame;
 use crate::map_point::MapPoint;
 use nalgebra::Point3;
 
@@ -191,7 +193,8 @@ impl OrbMatcher {
                         continue;
                     }
 
-                    let uv = current_frame.camera.project_n(&Point3::<f32>::from(x_3dc));
+                    let uv = current_frame.camera.project_n(&Point3::from(x_3dc));
+
                     let bounds = current_frame.constants.bounds;
                     if uv[0] < bounds.min_x || uv[0] > bounds.max_x {
                         continue;
@@ -410,6 +413,147 @@ impl OrbMatcher {
                                 rot_hist[bin].push(best_idx2 + n_left);
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // Apply rotation consistency
+        if self.check_orientation {
+            let maxima = compute_three_maxima(&rot_hist);
+            for i in 0..HISTO_LENGTH {
+                if Some(i) != maxima[0] && Some(i) != maxima[1] && Some(i) != maxima[2] {
+                    for j in 0..rot_hist[i].len() {
+                        current_frame.map_points[rot_hist[i][j]] = None;
+                        n_matches -= 1;
+                    }
+                }
+            }
+        }
+
+        n_matches
+    }
+
+    // Project MapPoints seen in KeyFrame into the Frame and search matches.
+    // Used in relocalisation (Tracking)
+    pub fn search_by_projection_keyframe(
+        &self,
+        current_frame: &mut Frame,
+        kf: &KeyFrame,
+        already_found: HashSet<Arc<MapPoint>>,
+        th: f32, // default 3.0
+        orb_dist: i32,
+    ) -> i32 {
+        let mut n_matches = 0;
+
+        let t_cw = current_frame.get_pose();
+        let t_wc = t_cw.inverse();
+        let ow = t_wc.translation.vector;
+
+        // Rotation Histogram (to check rotation consistency)
+        let mut rot_hist: [Vec<usize>; HISTO_LENGTH] =
+            std::array::from_fn(|_| Vec::with_capacity(500));
+        let factor = 1.0 / HISTO_LENGTH as f32;
+
+        let mps = kf.get_map_point_matches();
+
+        for (i, mp) in mps.into_iter().enumerate() {
+            if let Some(mp) = mp
+                && !mp.is_bad()
+                && !already_found.contains(&mp)
+            {
+                // Project
+                let x_3dw = mp.get_world_pos();
+                let x_3dc = t_cw * x_3dw;
+
+                let uv = current_frame.camera.project_n(&Point3::from(x_3dc));
+
+                let bounds = current_frame.constants.bounds;
+                if uv[0] < bounds.min_x || uv[0] > bounds.max_x {
+                    continue;
+                }
+                if uv[1] < bounds.min_y || uv[1] > bounds.max_y {
+                    continue;
+                }
+
+                // Compute predicted scale level
+                let po = x_3dw - ow;
+                let dist3d = po.norm();
+
+                let max_distance = mp.get_max_distance_invariance();
+                let min_distance = mp.get_min_distance_invariance();
+
+                // Depth must be inside the scale pyramid of the image
+                if dist3d < min_distance || dist3d > max_distance {
+                    continue;
+                }
+
+                let predicted_level = mp.predict_scale(dist3d, current_frame);
+
+                // Search in a window
+                let radius = th * current_frame.scale_factors[predicted_level];
+
+                let indices2 = current_frame.get_features_in_area(
+                    uv[0],
+                    uv[1],
+                    radius,
+                    predicted_level as i32 - 1,
+                    predicted_level as i32 + 1,
+                    false,
+                );
+                if indices2.is_empty() {
+                    continue;
+                }
+
+                let d_mp = mp.get_descriptor();
+
+                let mut best_dist = 256;
+                let mut best_idx2 = 0;
+
+                for i2 in indices2 {
+                    if current_frame
+                        .map_points
+                        .get(i2)
+                        .as_ref()
+                        .is_none_or(|inner| inner.is_none())
+                    {
+                        continue;
+                    }
+
+                    let d = current_frame.descriptors.row(i2 as i32).unwrap();
+
+                    let dist = descriptor_distance(&d_mp, &d);
+
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_idx2 = i2;
+                    }
+                }
+
+                if best_dist <= orb_dist {
+                    if let Some(p) = current_frame.map_points.get_mut(best_idx2) {
+                        *p = Some(mp);
+                        n_matches += 1;
+                    }
+
+                    if self.check_orientation {
+                        let mut rot = kf.keys_un.get(i).unwrap().angle()
+                            - current_frame
+                                .keys_un
+                                .as_ref()
+                                .unwrap()
+                                .get(best_idx2)
+                                .unwrap()
+                                .angle();
+                        if rot < 0. {
+                            rot += 360.;
+                        }
+                        let mut bin = (rot * factor).round() as usize;
+                        if bin == HISTO_LENGTH {
+                            bin = 0;
+                        }
+                        assert!(bin >= 0 && bin < HISTO_LENGTH);
+                        rot_hist[bin].push(best_idx2);
                     }
                 }
             }

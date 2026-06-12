@@ -3,6 +3,7 @@ use opencv::core::Mat;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    hash::{Hash, Hasher},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -139,6 +140,18 @@ pub struct MapPoint {
     map: Option<Arc<Map>>,
 }
 
+impl PartialEq for MapPoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for MapPoint {}
+impl Hash for MapPoint {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
 impl MapPoint {
     pub fn new() -> Self {
         MapPoint {
@@ -201,6 +214,26 @@ impl MapPoint {
 
     pub fn get_world_pos(&self) -> Vector3<f32> {
         self.world_pos
+    }
+
+    pub fn get_max_distance_invariance(&self) -> f32 {
+        1.2 * self.max_distance
+    }
+    pub fn get_min_distance_invariance(&self) -> f32 {
+        0.8 * self.min_distance
+    }
+
+    pub fn predict_scale(&self, current_dist: f32, f: &Frame) -> usize {
+        let ratio = self.max_distance / current_dist;
+
+        let mut scale = (ratio.ln() / f.log_scale_factor).ceil() as usize;
+        if scale < 0 {
+            scale = 0;
+        } else if scale >= f.scale_levels {
+            scale = f.scale_levels - 1;
+        }
+
+        scale
     }
 
     // TODO: HERE

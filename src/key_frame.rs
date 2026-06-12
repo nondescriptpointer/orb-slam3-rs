@@ -4,6 +4,7 @@ use std::sync::{Arc, atomic::AtomicUsize};
 
 use crate::{
     imu_types::{Bias, Calib, Preintegrated},
+    map_point::MapPoint,
     orb_vocabulary::{BowVector, FeatureVector},
 };
 
@@ -156,4 +157,9 @@ pub struct KeyFrame {
     // TODO: HERE
 }
 
-impl KeyFrame {}
+impl KeyFrame {
+    pub fn get_map_point_matches(&self) -> Vec<Option<Arc<MapPoint>>> {
+        // TODO: signature might also change
+        Vec::new()
+    }
+}

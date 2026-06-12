@@ -199,5 +199,9 @@ impl MapPoint {
         0
     }
 
+    pub fn get_world_pos(&self) -> Vector3<f32> {
+        self.world_pos
+    }
+
     // TODO: HERE
 }

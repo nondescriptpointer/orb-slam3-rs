@@ -327,12 +327,16 @@ impl Frame {
         x: f32,
         y: f32,
         r: f32,
-        min_level: i32,
-        max_level: i32,
-        right: bool,
+        min_level: i32, // default -1
+        max_level: i32, // default -1
+        right: bool,    // default false
     ) -> Vec<usize> {
         // TODO
         Vec::new()
+    }
+
+    pub fn get_pose(&self) -> Isometry3<f32> {
+        self.t_cw
     }
 }
 

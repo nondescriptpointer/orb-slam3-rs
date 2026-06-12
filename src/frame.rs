@@ -338,6 +338,9 @@ impl Frame {
     pub fn get_pose(&self) -> Isometry3<f32> {
         self.t_cw
     }
+    pub fn get_relative_pose_trl(&self) -> Isometry3<f32> {
+        self.t_rl
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

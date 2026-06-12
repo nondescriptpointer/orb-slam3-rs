@@ -314,7 +314,115 @@ impl OrbMatcher {
                         }
                     }
                     if let Some(n_left) = current_frame.n_left {
-                        // TODO
+                        let x_3dr = current_frame.get_relative_pose_trl() * x_3dc;
+                        let x_3dc_point = Point3::from(x_3dr);
+                        let uv = current_frame.camera.project_n(&x_3dc_point);
+
+                        let last_octave =
+                            if last_frame.n_left.is_none() || i < last_frame.n_left.unwrap() {
+                                last_frame.keys[i].octave()
+                            } else {
+                                last_frame.keys_right.as_ref().expect("missing keys")
+                                    [i - last_frame.n_left.expect("missing n left")]
+                                .octave()
+                            };
+
+                        // Search in a window. Size depend on scale
+                        let radius = th * current_frame.scale_factors[last_octave as usize];
+
+                        let indices2 = {
+                            let (min_level, max_level) = if forward {
+                                (last_octave, -1)
+                            } else if backward {
+                                (0, last_octave)
+                            } else {
+                                (last_octave - 1, last_octave + 1)
+                            };
+                            current_frame.get_features_in_area(
+                                uv[0], uv[1], radius, min_level, max_level, true,
+                            )
+                        };
+
+                        let d_mp = mp.get_descriptor();
+
+                        let mut best_dist = 256;
+                        let mut best_idx2 = 0;
+
+                        for i2 in indices2 {
+                            if let Some(Some(mp)) = current_frame.map_points.get(i2 + n_left) {
+                                if mp.observations() > 0 {
+                                    continue;
+                                }
+                            }
+                            let d = current_frame
+                                .descriptors
+                                .row((i2 + n_left) as i32)
+                                .expect("missing descriptor");
+                            let dist = descriptor_distance(&d_mp, &d);
+                            if dist < best_dist {
+                                best_dist = dist;
+                                best_idx2 = i2;
+                            }
+                        }
+                        if best_dist < TH_HIGH {
+                            *current_frame
+                                .map_points
+                                .get_mut(best_idx2 + n_left)
+                                .unwrap() = Some(mp.clone());
+                            n_matches += 1;
+
+                            if self.check_orientation {
+                                let kp_lf = if let Some(n_left) = last_frame.n_left {
+                                    if i < n_left {
+                                        last_frame.keys.get(i).unwrap()
+                                    } else {
+                                        last_frame
+                                            .keys_right
+                                            .as_ref()
+                                            .expect("missing keys right")
+                                            .get(i - n_left)
+                                            .unwrap()
+                                    }
+                                } else {
+                                    last_frame
+                                        .keys_un
+                                        .as_ref()
+                                        .expect("missing keys un")
+                                        .get(i)
+                                        .unwrap()
+                                };
+                                let kp_cf = current_frame
+                                    .keys_right
+                                    .as_ref()
+                                    .unwrap()
+                                    .get(best_idx2)
+                                    .unwrap();
+
+                                let mut rot = kp_lf.angle() - kp_cf.angle();
+                                if rot < 0. {
+                                    rot += 360.;
+                                }
+                                let mut bin = (rot * factor).round() as usize;
+                                if bin == HISTO_LENGTH {
+                                    bin = 0;
+                                }
+                                assert!(bin >= 0 && bin < HISTO_LENGTH);
+                                rot_hist[bin].push(best_idx2 + n_left);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply rotation consistency
+        if self.check_orientation {
+            let maxima = compute_three_maxima(&rot_hist);
+            for i in 0..HISTO_LENGTH {
+                if Some(i) != maxima[0] && Some(i) != maxima[1] && Some(i) != maxima[2] {
+                    for j in 0..rot_hist[i].len() {
+                        current_frame.map_points[rot_hist[i][j]] = None;
+                        n_matches -= 1;
                     }
                 }
             }

@@ -249,5 +249,26 @@ impl MapPoint {
         self.normal_vector
     }
 
+    pub fn is_in_keyframe(&self, _kf: &KeyFrame) -> bool {
+        // TODO
+        false
+    }
+
+    /// Returns `(left_index, right_index)` of this point's observation in `kf`,
+    /// each `-1` when not observed on that camera.
+    pub fn get_index_in_keyframe(&self, _kf: &KeyFrame) -> (i32, i32) {
+        // TODO
+        (-1, -1)
+    }
+
+    pub fn add_observation(&self, _kf: &KeyFrame, _idx: i32) {
+        // TODO
+    }
+
+    /// Replace this MapPoint with `other` everywhere it is observed.
+    pub fn replace(&self, _other: &Arc<MapPoint>) {
+        // TODO
+    }
+
     // TODO: HERE
 }

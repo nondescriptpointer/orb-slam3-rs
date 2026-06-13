@@ -1,5 +1,6 @@
 use nalgebra::{Isometry3, Matrix3, Vector3};
 use opencv::core::{KeyPoint, Mat};
+use std::collections::HashSet;
 use std::sync::{Arc, atomic::AtomicUsize};
 
 use crate::{
@@ -199,5 +200,22 @@ impl KeyFrame {
     }
     pub fn get_right_pose_inverse(&self) -> Isometry3<f32> {
         self.twc * self.tlr
+    }
+    pub fn get_right_camera_center(&self) -> Vector3<f32> {
+        self.get_right_pose_inverse().translation.vector
+    }
+
+    pub fn get_map_point(&self, _idx: i32) -> Option<Arc<MapPoint>> {
+        // TODO
+        None
+    }
+
+    pub fn get_map_points(&self) -> HashSet<Arc<MapPoint>> {
+        // TODO
+        HashSet::new()
+    }
+
+    pub fn add_map_point(&self, _mp: Arc<MapPoint>, _idx: i32) {
+        // TODO
     }
 }

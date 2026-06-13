@@ -1482,6 +1482,417 @@ impl OrbMatcher {
 
         n_matches
     }
+
+    // Project MapPoints into a KeyFrame and search for duplicated MapPoints,
+    // fusing them. `right` selects the second (right) fisheye camera.
+    // Used in Local Mapping.
+    pub fn fuse(
+        &self,
+        kf: &KeyFrame,
+        map_points: &[Option<Arc<MapPoint>>],
+        th: f32,
+        right: bool,
+    ) -> i32 {
+        let (tcw, ow, camera) = if right {
+            (
+                kf.get_right_pose(),
+                kf.get_right_camera_center(),
+                kf.camera2.as_ref().expect("camera2"),
+            )
+        } else {
+            (*kf.get_pose(), *kf.get_camera_center(), &kf.camera)
+        };
+        let bf = kf.bf;
+
+        let mut n_fused = 0;
+
+        for mp in map_points.iter().flatten() {
+            if mp.is_bad() || mp.is_in_keyframe(kf) {
+                continue;
+            }
+
+            let p3dw = mp.get_world_pos();
+            let p3dc = tcw * Point3::from(p3dw);
+
+            // Depth must be positive
+            if p3dc[2] < 0.0 {
+                continue;
+            }
+
+            let invz = 1.0 / p3dc[2];
+            let uv = camera.project_n(&p3dc);
+
+            // Point must be inside the image
+            if !kf.is_in_image(uv.x, uv.y) {
+                continue;
+            }
+
+            let ur = uv.x - bf * invz;
+
+            let max_distance = mp.get_max_distance_invariance();
+            let min_distance = mp.get_min_distance_invariance();
+            let po = p3dw - ow;
+            let dist3d = po.norm();
+
+            // Depth must be inside the scale pyramid of the image
+            if dist3d < min_distance || dist3d > max_distance {
+                continue;
+            }
+
+            // Viewing angle must be less than 60 deg
+            let pn = mp.get_normal();
+            if po.dot(&pn) < 0.5 * dist3d {
+                continue;
+            }
+
+            let predicted_level = mp.predict_scale_keyframe(dist3d, kf);
+            let radius = th * kf.scale_factors[predicted_level];
+            let indices = kf.get_features_in_area(uv.x, uv.y, radius, right);
+            if indices.is_empty() {
+                continue;
+            }
+
+            // Match to the most similar keypoint in the radius
+            let d_mp = mp.get_descriptor();
+
+            let mut best_dist = 256;
+            let mut best_idx: i32 = -1;
+            for idx in indices {
+                let kp = match kf.n_left {
+                    None => &kf.keys_un[idx],
+                    Some(_) if !right => &kf.keys[idx],
+                    Some(_) => &kf.keys_right.as_ref().expect("keys_right")[idx],
+                };
+                let kp_level = kp.octave();
+                if kp_level < predicted_level as i32 - 1 || kp_level > predicted_level as i32 {
+                    continue;
+                }
+
+                let ex = uv.x - kp.pt().x;
+                let ey = uv.y - kp.pt().y;
+                if kf.u_right[idx] >= 0.0 {
+                    // Check reprojection error in stereo
+                    let er = ur - kf.u_right[idx];
+                    let e2 = ex * ex + ey * ey + er * er;
+                    if e2 * kf.inv_level_sigma2[kp_level as usize] > 7.8 {
+                        continue;
+                    }
+                } else {
+                    let e2 = ex * ex + ey * ey;
+                    if e2 * kf.inv_level_sigma2[kp_level as usize] > 5.99 {
+                        continue;
+                    }
+                }
+
+                // Right keypoints are stored after the left ones in the
+                // descriptor matrix.
+                let idx = if right {
+                    idx + kf.n_left.expect("n_left")
+                } else {
+                    idx
+                };
+                let d_kf = kf.descriptors.row(idx as i32).expect("kf descriptor");
+                let dist = descriptor_distance(&d_mp, &d_kf);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_idx = idx as i32;
+                }
+            }
+
+            // If there is already a MapPoint replace, otherwise add a new one.
+            if best_dist <= TH_LOW {
+                if let Some(mp_in_kf) = kf.get_map_point(best_idx) {
+                    if !mp_in_kf.is_bad() {
+                        if mp_in_kf.observations() > mp.observations() {
+                            mp.replace(&mp_in_kf);
+                        } else {
+                            mp_in_kf.replace(mp);
+                        }
+                    }
+                } else {
+                    mp.add_observation(kf, best_idx);
+                    kf.add_map_point(mp.clone(), best_idx);
+                }
+                n_fused += 1;
+            }
+        }
+
+        n_fused
+    }
+
+    // Project MapPoints into a KeyFrame using a Sim3 transform and search for
+    // duplications. Matches found against an existing MapPoint are recorded in
+    // `replace_points` (to be replaced by the caller). Used in Loop Closing.
+    pub fn fuse_by_sim3(
+        &self,
+        kf: &KeyFrame,
+        scw: &Similarity3<f32>,
+        points: &[Arc<MapPoint>],
+        th: f32,
+        replace_points: &mut [Option<Arc<MapPoint>>],
+    ) -> i32 {
+        // Decompose Scw into an SE3 (scale folded into the translation).
+        let t_cw = Isometry3::from_parts(
+            Translation3::from(scw.isometry.translation.vector / scw.scaling()),
+            scw.isometry.rotation,
+        );
+        let ow = t_cw.inverse().translation.vector;
+
+        // Set of MapPoints already found in the KeyFrame
+        let already_found = kf.get_map_points();
+
+        let mut n_fused = 0;
+
+        for (i_mp, mp) in points.iter().enumerate() {
+            // Discard bad MapPoints and already found
+            if mp.is_bad() || already_found.contains(mp) {
+                continue;
+            }
+
+            let p3dw = mp.get_world_pos();
+            let p3dc = t_cw * Point3::from(p3dw);
+
+            // Depth must be positive
+            if p3dc[2] < 0.0 {
+                continue;
+            }
+
+            let uv = kf.camera.project_n(&p3dc);
+            if !kf.is_in_image(uv.x, uv.y) {
+                continue;
+            }
+
+            let max_distance = mp.get_max_distance_invariance();
+            let min_distance = mp.get_min_distance_invariance();
+            let po = p3dw - ow;
+            let dist3d = po.norm();
+            if dist3d < min_distance || dist3d > max_distance {
+                continue;
+            }
+
+            // Viewing angle must be less than 60 deg
+            let pn = mp.get_normal();
+            if po.dot(&pn) < 0.5 * dist3d {
+                continue;
+            }
+
+            let predicted_level = mp.predict_scale_keyframe(dist3d, kf);
+            let radius = th * kf.scale_factors[predicted_level];
+            let indices = kf.get_features_in_area(uv.x, uv.y, radius, false);
+            if indices.is_empty() {
+                continue;
+            }
+
+            let d_mp = mp.get_descriptor();
+
+            let mut best_dist = i32::MAX;
+            let mut best_idx: i32 = -1;
+            for idx in indices {
+                let kp_level = kf.keys_un[idx].octave();
+                if kp_level < predicted_level as i32 - 1 || kp_level > predicted_level as i32 {
+                    continue;
+                }
+                let d_kf = kf.descriptors.row(idx as i32).expect("kf descriptor");
+                let dist = descriptor_distance(&d_mp, &d_kf);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_idx = idx as i32;
+                }
+            }
+
+            // If there is already a MapPoint replace, otherwise add a new one.
+            if best_dist <= TH_LOW {
+                if let Some(mp_in_kf) = kf.get_map_point(best_idx) {
+                    if !mp_in_kf.is_bad() {
+                        replace_points[i_mp] = Some(mp_in_kf);
+                    }
+                } else {
+                    mp.add_observation(kf, best_idx);
+                    kf.add_map_point(mp.clone(), best_idx);
+                }
+                n_fused += 1;
+            }
+        }
+
+        n_fused
+    }
+
+    // Search matches between MapPoints of two KeyFrames given a Sim3
+    // transformation S12 (from KF2 to KF1). `matches12` is both input (already
+    // known matches) and output. Used in Loop Closing.
+    pub fn search_by_sim3(
+        &self,
+        kf1: &KeyFrame,
+        kf2: &KeyFrame,
+        matches12: &mut [Option<Arc<MapPoint>>],
+        s12: &Similarity3<f32>,
+        th: f32,
+    ) -> i32 {
+        // The original uses KF1's intrinsics for both projections.
+        let fx = kf1.fx;
+        let fy = kf1.fy;
+        let cx = kf1.cx;
+        let cy = kf1.cy;
+
+        // Camera 1 & 2 from world
+        let t1w = kf1.get_pose();
+        let t2w = kf2.get_pose();
+
+        // Transformation between cameras
+        let s21 = s12.inverse();
+
+        let map_points1 = kf1.get_map_point_matches();
+        let map_points2 = kf2.get_map_point_matches();
+        let n1 = map_points1.len();
+        let n2 = map_points2.len();
+
+        let mut already_matched1 = vec![false; n1];
+        let mut already_matched2 = vec![false; n2];
+
+        for (i, m) in matches12.iter().enumerate().take(n1) {
+            if let Some(mp) = m {
+                already_matched1[i] = true;
+                let idx2 = mp.get_index_in_keyframe(kf2).0;
+                if idx2 >= 0 && (idx2 as usize) < n2 {
+                    already_matched2[idx2 as usize] = true;
+                }
+            }
+        }
+
+        let mut match1 = vec![-1i32; n1];
+        let mut match2 = vec![-1i32; n2];
+
+        // Transform from KF1 to KF2 and search
+        for i1 in 0..n1 {
+            let Some(mp) = &map_points1[i1] else {
+                continue;
+            };
+            if already_matched1[i1] || mp.is_bad() {
+                continue;
+            }
+
+            let p3dw = mp.get_world_pos();
+            let p3dc1 = t1w * Point3::from(p3dw);
+            let p3dc2 = s21 * p3dc1;
+
+            if p3dc2[2] < 0.0 {
+                continue;
+            }
+
+            let invz = 1.0 / p3dc2[2];
+            let u = fx * p3dc2[0] * invz + cx;
+            let v = fy * p3dc2[1] * invz + cy;
+            if !kf2.is_in_image(u, v) {
+                continue;
+            }
+
+            let max_distance = mp.get_max_distance_invariance();
+            let min_distance = mp.get_min_distance_invariance();
+            let dist3d = p3dc2.coords.norm();
+            if dist3d < min_distance || dist3d > max_distance {
+                continue;
+            }
+
+            let predicted_level = mp.predict_scale_keyframe(dist3d, kf2);
+            let radius = th * kf2.scale_factors[predicted_level];
+            let indices = kf2.get_features_in_area(u, v, radius, false);
+            if indices.is_empty() {
+                continue;
+            }
+
+            let d_mp = mp.get_descriptor();
+            let mut best_dist = i32::MAX;
+            let mut best_idx: i32 = -1;
+            for idx in indices {
+                let octave = kf2.keys_un[idx].octave();
+                if octave < predicted_level as i32 - 1 || octave > predicted_level as i32 {
+                    continue;
+                }
+                let d_kf = kf2.descriptors.row(idx as i32).expect("kf2 descriptor");
+                let dist = descriptor_distance(&d_mp, &d_kf);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_idx = idx as i32;
+                }
+            }
+            if best_dist <= TH_HIGH {
+                match1[i1] = best_idx;
+            }
+        }
+
+        // Transform from KF2 to KF1 and search
+        for i2 in 0..n2 {
+            let Some(mp) = &map_points2[i2] else {
+                continue;
+            };
+            if already_matched2[i2] || mp.is_bad() {
+                continue;
+            }
+
+            let p3dw = mp.get_world_pos();
+            let p3dc2 = t2w * Point3::from(p3dw);
+            let p3dc1 = s12 * p3dc2;
+
+            if p3dc1[2] < 0.0 {
+                continue;
+            }
+
+            let invz = 1.0 / p3dc1[2];
+            let u = fx * p3dc1[0] * invz + cx;
+            let v = fy * p3dc1[1] * invz + cy;
+            if !kf1.is_in_image(u, v) {
+                continue;
+            }
+
+            let max_distance = mp.get_max_distance_invariance();
+            let min_distance = mp.get_min_distance_invariance();
+            let dist3d = p3dc1.coords.norm();
+            if dist3d < min_distance || dist3d > max_distance {
+                continue;
+            }
+
+            let predicted_level = mp.predict_scale_keyframe(dist3d, kf1);
+            let radius = th * kf1.scale_factors[predicted_level];
+            let indices = kf1.get_features_in_area(u, v, radius, false);
+            if indices.is_empty() {
+                continue;
+            }
+
+            let d_mp = mp.get_descriptor();
+            let mut best_dist = i32::MAX;
+            let mut best_idx: i32 = -1;
+            for idx in indices {
+                let octave = kf1.keys_un[idx].octave();
+                if octave < predicted_level as i32 - 1 || octave > predicted_level as i32 {
+                    continue;
+                }
+                let d_kf = kf1.descriptors.row(idx as i32).expect("kf1 descriptor");
+                let dist = descriptor_distance(&d_mp, &d_kf);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_idx = idx as i32;
+                }
+            }
+            if best_dist <= TH_HIGH {
+                match2[i2] = best_idx;
+            }
+        }
+
+        // Check agreement (mutual best match).
+        let mut n_found = 0;
+        for i1 in 0..n1 {
+            let idx2 = match1[i1];
+            if idx2 >= 0 {
+                let idx1 = match2[idx2 as usize];
+                if idx1 == i1 as i32 {
+                    matches12[i1] = map_points2[idx2 as usize].clone();
+                    n_found += 1;
+                }
+            }
+        }
+
+        n_found
+    }
 }
 
 // Selects the keypoint for `idx`, picking between the undistorted / left /

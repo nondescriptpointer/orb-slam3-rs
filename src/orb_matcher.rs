@@ -8,8 +8,8 @@ use crate::key_frame::KeyFrame;
 use crate::map_point::MapPoint;
 use nalgebra::{Isometry3, Matrix3, Point3, Similarity3, Translation3};
 
-const TH_HIGH: i32 = 100;
-const TH_LOW: i32 = 50;
+pub(crate) const TH_HIGH: i32 = 100;
+pub(crate) const TH_LOW: i32 = 50;
 const HISTO_LENGTH: usize = 30;
 
 pub struct OrbMatcher {
@@ -1994,7 +1994,7 @@ fn is_right(kf: &KeyFrame, idx: usize) -> bool {
 
 // Computes the Hamming distance between two ORB descriptors
 // Original code uses bit-twiddling here but count_ones() should be efficient as is
-fn descriptor_distance(a: &impl MatTraitConst, b: &impl MatTraitConst) -> i32 {
+pub(crate) fn descriptor_distance(a: &impl MatTraitConst, b: &impl MatTraitConst) -> i32 {
     let pa: &[u8] = a.data_bytes().expect("descriptor a");
     let pb: &[u8] = b.data_bytes().expect("descriptor b");
     pa.iter()

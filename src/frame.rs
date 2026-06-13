@@ -1,29 +1,105 @@
-use nalgebra::{Isometry3, Matrix3, Vector3};
-use opencv::calib3d::undistort_points;
-use opencv::core::{CV_32F, KeyPoint, KeyPointTrait, KeyPointTraitConst, Mat, MatTraitConst};
-use opencv::core::{MatTrait, Scalar};
-use opencv::core::{NORM_HAMMING, Point2f};
-use opencv::features2d::BFMatcher;
+//! A handful of structural decisions differ from the C++ original to stay idiomatic and lock-free:
+//!
+//! * The C++ `Frame` keeps a pile of **static** members (`fx`, `fy`, `cx`,
+//!   `cy`, the undistorted image bounds and the grid-cell sizes) guarded by the
+//!   one-shot `mbInitialComputations` flag. Those are per-calibration constants,
+//!   not per-frame state, so they live in a shared [`FrameConstants`] held
+//!   behind an `Arc` instead.
+//!
+//! * Optional data that only exists for some sensor configurations
+//!   (`mvKeysRight`, `mvKeysUn`, the right grid, the stereo-fisheye matches, …)
+//!   is modelled with `Option`/empty collections rather than the sentinel
+//!   values (`Nleft == -1`) used in C++.
+//!
+//! ## Threading / mutability
+//!
+//! In ORB-SLAM3 a `Frame` is, in practice, **owned by the Tracking thread**.
+//! The only field the C++ code actually guards with a mutex (`mpMutexImu`) is
+//! the `mbImuPreintegrated` boolean, which LocalMapping flips once it has
+//! finished preintegrating the frame's IMU measurements while Tracking polls
+//! it.
+//!
+//! The cleanest lock-free shape for the Rust port, as implemented here:
+//!
+//! * Keep `Frame` single-owner inside Tracking and hand out **immutable
+//!   snapshots** via `Arc<Frame>` to other threads. Pose/feature data is then
+//!   read-only for everyone but the owner, so `get_pose`/`set_pose` need no
+//!   synchronisation — `set_pose` takes `&mut self`, which the borrow checker
+//!   already proves is exclusive. The same goes for the owner-only `is_set` /
+//!   `has_pose` / `has_velocity` flags.
+//! * The one genuinely cross-thread field (`is_imu_preintegrated`, the C++
+//!   `mpMutexImu`-guarded `mbImuPreintegrated`) is a single [`AtomicBool`]
+//!   accessed with `Ordering::Acquire`/`Release`. It is one word, never blocks,
+//!   and expresses the exact publish/observe handshake LocalMapping↔Tracking
+//!   need: LocalMapping calls `set_integrated(&self)` — note the shared `&self`,
+//!   the atomic gives interior mutability — and Tracking polls
+//!   `imu_is_preintegrated()`. This is strictly cheaper than a `std::mutex` and
+//!   removes the only lock that was on the hot path.
+//! * Anything that must be *mutated* through a shared `Arc` (e.g. a
+//!   `MapPoint`'s tracking scratch fields written by `is_in_frustum`) is pushed
+//!   out of the shared object: `is_in_frustum` is pure and **returns** the
+//!   projection instead of writing it back, so no interior mutability / lock is
+//!   needed on the shared `MapPoint`.
+
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use nalgebra::{Isometry3, Matrix3, Point3, Vector3};
+use opencv::calib3d::undistort_points;
+use opencv::core::{
+    CV_32F, KeyPoint, KeyPointTrait, KeyPointTraitConst, Mat, MatTrait, MatTraitConst,
+    NORM_HAMMING, NORM_L1, Point2f, Rect, Scalar, Vector,
+};
+use opencv::core::{DMatch, norm2, vconcat2};
+use opencv::features2d::{BFMatcher, prelude::DescriptorMatcherTraitConst};
+use opencv::prelude::MatTraitConstManual;
 
 use crate::camera_models::GeometricCamera;
+use crate::camera_models::kannala_brandt8::KannalaBrandt8;
 use crate::converter::mat_to_matrix3f;
 use crate::g2o_types::ConstraintPoseIMU;
-use crate::imu_types::Bias;
-use crate::imu_types::Calib;
-use crate::imu_types::Preintegrated;
+use crate::imu_types::{Bias, Calib, Preintegrated};
 use crate::key_frame::KeyFrame;
 use crate::map_point::MapPoint;
 use crate::orb_extractor::{ExtractionError, OrbExtractResult, OrbExtractor};
-use crate::orb_vocabulary::BowVector;
-use crate::orb_vocabulary::FeatureVector;
-use crate::orb_vocabulary::OrbVocabulary;
+use crate::orb_matcher::{TH_HIGH, TH_LOW, descriptor_distance};
+use crate::orb_vocabulary::{BowVector, DESC_LEN, Descriptor, FeatureVector, OrbVocabulary};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
-/// Number of rows/cols in the keypoint-to-cell grid
+/// Lock-free boolean flag with `Clone` semantics suitable for a `#[derive(Clone)]`
+/// struct: cloning snapshots the current value into a fresh atomic.
+///
+/// Used for the cross-thread `is_imu_preintegrated` flag so LocalMapping can
+/// publish it through a shared `&Frame` without a mutex (see the module docs).
+#[derive(Debug)]
+pub struct AtomicFlag(AtomicBool);
+
+impl AtomicFlag {
+    #[inline]
+    pub fn new(value: bool) -> Self {
+        AtomicFlag(AtomicBool::new(value))
+    }
+    /// Observe the flag (`Acquire`).
+    #[inline]
+    pub fn get(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+    /// Publish the flag (`Release`).
+    #[inline]
+    pub fn set(&self, value: bool) {
+        self.0.store(value, Ordering::Release);
+    }
+}
+
+impl Clone for AtomicFlag {
+    fn clone(&self) -> Self {
+        AtomicFlag::new(self.get())
+    }
+}
+
+/// Number of rows/cols in the keypoint-to-cell grid.
 pub const FRAME_GRID_ROWS: usize = 48;
 pub const FRAME_GRID_COLS: usize = 64;
 
@@ -53,7 +129,7 @@ pub struct Frame {
     pub b: f32,
 
     // Threshold close/far points. Close points are inserted from 1 view.
-    // Far points ar einserted as in the monocular case from 2 views.
+    // Far points are inserted as in the monocular case from 2 views.
     pub th_depth: f32,
 
     // Number of KeyPoints
@@ -98,7 +174,7 @@ pub struct Frame {
 
     // IMU preintegration from last keyframe
     pub imu_preintegrated: Option<Arc<Preintegrated>>,
-    pub last_keyframe: Arc<KeyFrame>,
+    pub last_keyframe: Option<Arc<KeyFrame>>,
 
     // Pointer to previous frame
     pub prev_frame: Option<Arc<Frame>>,
@@ -132,7 +208,7 @@ pub struct Frame {
     pub mono_left: Option<usize>,
     pub mono_right: Option<usize>,
 
-    // For stereo matching
+    // For stereo matching. `usize::MAX` marks an unmatched keypoint.
     pub left_to_right_match: Option<Vec<usize>>,
     pub right_to_left_match: Option<Vec<usize>>,
 
@@ -148,7 +224,8 @@ pub struct Frame {
     #[cfg(feature = "register-times")]
     pub time_stereo_match: f64,
 
-    cpi: Option<ConstraintPoseIMU>,
+    // Optimization constraint (`mpcpi` in C++); set by the optimizer.
+    pub cpi: Option<ConstraintPoseIMU>,
 
     // nalgebra migration
     t_cw: Isometry3<f32>,
@@ -168,12 +245,118 @@ pub struct Frame {
     has_velocity: bool,
 
     is_set: bool,
-    is_imu_preintegrated: bool,
-    // TODO? mutex
+    // Cross-thread flag flipped by LocalMapping once preintegration is done and
+    // polled by Tracking. Lock-free `AtomicBool` instead of the C++ `mpMutexImu`
+    // (see the module-level "Threading / mutability analysis").
+    is_imu_preintegrated: AtomicFlag,
+}
+
+/// Per-camera projection of a [`MapPoint`] computed by [`Frame::is_in_frustum`].
+///
+/// In C++ these values are written straight into the `MapPoint`'s `mTrack*`
+/// scratch fields. Returning them instead keeps the shared `MapPoint`
+/// immutable (see the module-level threading analysis); the caller copies them
+/// where it needs them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrackInfo {
+    pub proj_x: f32,
+    pub proj_y: f32,
+    /// Right-image x coordinate (`u - bf/z` for rectified stereo).
+    pub proj_xr: f32,
+    pub depth: f32,
+    pub scale_level: i32,
+    pub view_cos: f32,
+}
+
+/// Result of a frustum check: the left and/or right projection, if visible.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FrustumResult {
+    pub left: Option<TrackInfo>,
+    pub right: Option<TrackInfo>,
+}
+
+impl FrustumResult {
+    /// `true` if the point projects into either camera.
+    pub fn in_view(&self) -> bool {
+        self.left.is_some() || self.right.is_some()
+    }
+}
+
+/// Scale-pyramid info copied out of an [`OrbExtractor`] into every [`Frame`].
+struct ScaleInfo {
+    scale_levels: usize,
+    scale_factor: f32,
+    log_scale_factor: f32,
+    scale_factors: Vec<f32>,
+    inv_scale_factors: Vec<f32>,
+    level_sigma2: Vec<f32>,
+    inv_level_sigma2: Vec<f32>,
+}
+
+impl ScaleInfo {
+    fn from_extractor(extractor: &OrbExtractor) -> Self {
+        let scale_factor = extractor.get_scale_factor();
+        ScaleInfo {
+            scale_levels: extractor.get_levels(),
+            scale_factor,
+            log_scale_factor: scale_factor.ln(),
+            scale_factors: extractor.get_scale_factors(),
+            inv_scale_factors: extractor.get_inverse_scale_factors(),
+            level_sigma2: extractor.get_scale_sigma2(),
+            inv_level_sigma2: extractor.get_inverse_scale_sigma2(),
+        }
+    }
+}
+
+/// Shared inputs that every constructor forwards to [`Frame::assemble`].
+struct FrameConfig {
+    orb_vocabulary: Arc<OrbVocabulary>,
+    extractor_left: Arc<OrbExtractor>,
+    extractor_right: Arc<OrbExtractor>,
+    timestamp: f64,
+    constants: Arc<FrameConstants>,
+    b_fx: f32,
+    b: f32,
+    th_depth: f32,
+    camera: Arc<dyn GeometricCamera>,
+    camera2: Option<Arc<dyn GeometricCamera>>,
+    imu_calib: Calib,
+    prev_frame: Option<Arc<Frame>>,
+}
+
+/// Sensor-specific feature data produced by each constructor and merged into a
+/// [`Frame`] by [`Frame::assemble`].
+struct ExtractedFrame {
+    keys: Vec<KeyPoint>,
+    keys_right: Option<Vec<KeyPoint>>,
+    keys_un: Option<Vec<KeyPoint>>,
+    descriptors: Mat,
+    descriptors_right: Option<Mat>,
+    u_right: Vec<f32>,
+    depth: Vec<f32>,
+    n: usize,
+    n_left: Option<usize>,
+    n_right: Option<usize>,
+    mono_left: Option<usize>,
+    mono_right: Option<usize>,
+    left_to_right_match: Option<Vec<usize>>,
+    right_to_left_match: Option<Vec<usize>>,
+    stereo_3d_points: Option<Vec<Vector3<f32>>>,
+    grid: Vec<Vec<usize>>,
+    grid_right: Vec<Vec<usize>>,
+    close_mps: usize,
+    /// Stereo-fisheye left→right rigid transform (identity otherwise).
+    t_lr: Isometry3<f32>,
+    #[cfg(feature = "register-times")]
+    time_orb_ext: f64,
+    #[cfg(feature = "register-times")]
+    time_stereo_match: f64,
 }
 
 impl Frame {
-    fn from_stereo_cameras(
+    /// Constructor for rectified stereo cameras (single pinhole model).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_stereo(
         im_left: &Mat,
         im_right: &Mat,
         timestamp: f64,
@@ -187,26 +370,17 @@ impl Frame {
         prev_frame: Option<Arc<Frame>>,
         imu_calib: Calib,
     ) -> Self {
-        let scale_levels = extractor_left.get_levels();
-        let scale_factor = extractor_left.get_scale_factor();
-        let log_scale_factor = scale_factor.ln();
-        let scale_factors = extractor_left.get_scale_factors();
-        let inv_scale_factors = extractor_left.get_inverse_scale_factors();
-        let level_sigma2 = extractor_left.get_scale_sigma2();
-        let inv_level_sigma2 = extractor_left.get_inverse_scale_sigma2();
-
         #[cfg(feature = "register-times")]
         let time_start_ext_orb = std::time::Instant::now();
 
-        let (left_res, right_res) = std::thread::scope(|s| {
-            let left_handle = s.spawn(|| extract_orb(extractor_left.as_ref(), im_left, 0, 0));
-            let right_handle = s.spawn(|| extract_orb(extractor_right.as_ref(), im_right, 0, 0));
-            let left = left_handle.join().expect("left ORB thread panicked");
-            let right = right_handle.join().expect("right ORB thread panicked");
-            (left, right)
-        });
-        let left_res = left_res.expect("left ORB extraction failed");
-        let right_res = right_res.expect("right ORB extraction failed");
+        let (left_res, right_res) = extract_orb_stereo(
+            extractor_left.as_ref(),
+            extractor_right.as_ref(),
+            im_left,
+            im_right,
+            [0, 0],
+            [0, 0],
+        );
 
         #[cfg(feature = "register-times")]
         let time_orb_ext = time_start_ext_orb.elapsed().as_secs_f64() * 1000.0;
@@ -217,129 +391,885 @@ impl Frame {
         let descriptors_right = right_res.descriptors.unwrap_or_default();
         let n = keys.len();
 
-        // Undistort keypoints
-        let camera_k = camera.to_k();
-        let keys_un = undistort_keypoints(
-            n as i32,
-            &constants.dist_coef,
-            &camera_k,
-            &constants.k,
-            &keys,
-        );
-
-        #[cfg(feature = "register-times")]
-        let time_start_stareo_matches = std::time::Instant::now();
-
-        // TODO: after completing stereo matching
-
-        #[cfg(feature = "register-times")]
-        let time_stereo_match = time_start_stareo_matches.elapsed().as_secs_f64() * 1000.0;
-
-        let map_points = vec![None; n];
-        let outlier = vec![false; n];
-        let project_points = HashMap::new();
-        let matched_in_image = HashMap::new();
+        // Undistort keypoints (no-op for already-rectified images, but matches C++).
+        let keys_un =
+            undistort_keypoints(&constants.dist_coef, &camera.to_k(), &constants.k, &keys);
 
         let b = b_fx / constants.intrinsics.fx;
 
-        let mut has_velocity = false;
-        let vw = if let Some(prev_frame) = prev_frame {
-            if prev_frame.has_velocity {
-                has_velocity = true;
-                prev_frame.vw.clone()
-            } else {
-                Vector3::zeros()
-            }
-        } else {
-            Vector3::zeros()
-        };
+        #[cfg(feature = "register-times")]
+        let time_start_stereo = std::time::Instant::now();
+
+        let (u_right, depth) = compute_stereo_matches(
+            &keys,
+            &keys_right,
+            &descriptors,
+            &descriptors_right,
+            &left_res.image_pyramid,
+            &right_res.image_pyramid,
+            &extractor_left.get_scale_factors(),
+            &extractor_left.get_inverse_scale_factors(),
+            b,
+            b_fx,
+        );
+
+        #[cfg(feature = "register-times")]
+        let time_stereo_match = time_start_stereo.elapsed().as_secs_f64() * 1000.0;
+
+        let (grid, grid_right) =
+            assign_features_to_grid(n, None, &keys, None, Some(&keys_un), &constants.bounds);
+
+        Self::assemble(
+            FrameConfig {
+                orb_vocabulary,
+                extractor_left,
+                extractor_right,
+                timestamp,
+                constants,
+                b_fx,
+                b,
+                th_depth,
+                camera,
+                camera2: None,
+                imu_calib,
+                prev_frame,
+            },
+            ExtractedFrame {
+                keys,
+                keys_right: Some(keys_right),
+                keys_un: Some(keys_un),
+                descriptors,
+                descriptors_right: Some(descriptors_right),
+                u_right,
+                depth,
+                n,
+                n_left: None,
+                n_right: None,
+                mono_left: None,
+                mono_right: None,
+                left_to_right_match: None,
+                right_to_left_match: None,
+                stereo_3d_points: None,
+                grid,
+                grid_right,
+                close_mps: 0,
+                t_lr: Isometry3::identity(),
+                #[cfg(feature = "register-times")]
+                time_orb_ext,
+                #[cfg(feature = "register-times")]
+                time_stereo_match,
+            },
+        )
+    }
+
+    /// Constructor for RGB-D cameras.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_rgbd(
+        im_gray: &Mat,
+        im_depth: &Mat,
+        timestamp: f64,
+        extractor: Arc<OrbExtractor>,
+        orb_vocabulary: Arc<OrbVocabulary>,
+        constants: Arc<FrameConstants>,
+        b_fx: f32,
+        th_depth: f32,
+        camera: Arc<dyn GeometricCamera>,
+        prev_frame: Option<Arc<Frame>>,
+        imu_calib: Calib,
+    ) -> Self {
+        #[cfg(feature = "register-times")]
+        let time_start_ext_orb = std::time::Instant::now();
+
+        let res = extract_orb(extractor.as_ref(), im_gray, [0, 0]);
+
+        #[cfg(feature = "register-times")]
+        let time_orb_ext = time_start_ext_orb.elapsed().as_secs_f64() * 1000.0;
+
+        let keys = res.keypoints;
+        let descriptors = res.descriptors.unwrap_or_default();
+        let n = keys.len();
+
+        let keys_un =
+            undistort_keypoints(&constants.dist_coef, &camera.to_k(), &constants.k, &keys);
+
+        let b = b_fx / constants.intrinsics.fx;
+        let (u_right, depth) = compute_stereo_from_rgbd(&keys, &keys_un, im_depth, b_fx);
+
+        let (grid, grid_right) =
+            assign_features_to_grid(n, None, &keys, None, Some(&keys_un), &constants.bounds);
+
+        Self::assemble(
+            FrameConfig {
+                orb_vocabulary,
+                extractor_left: extractor.clone(),
+                extractor_right: extractor,
+                timestamp,
+                constants,
+                b_fx,
+                b,
+                th_depth,
+                camera,
+                camera2: None,
+                imu_calib,
+                prev_frame,
+            },
+            ExtractedFrame {
+                keys,
+                keys_right: None,
+                keys_un: Some(keys_un),
+                descriptors,
+                descriptors_right: None,
+                u_right,
+                depth,
+                n,
+                n_left: None,
+                n_right: None,
+                mono_left: None,
+                mono_right: None,
+                left_to_right_match: None,
+                right_to_left_match: None,
+                stereo_3d_points: None,
+                grid,
+                grid_right,
+                close_mps: 0,
+                t_lr: Isometry3::identity(),
+                #[cfg(feature = "register-times")]
+                time_orb_ext,
+                #[cfg(feature = "register-times")]
+                time_stereo_match: 0.0,
+            },
+        )
+    }
+
+    /// Constructor for monocular cameras.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_monocular(
+        im_gray: &Mat,
+        timestamp: f64,
+        extractor: Arc<OrbExtractor>,
+        orb_vocabulary: Arc<OrbVocabulary>,
+        constants: Arc<FrameConstants>,
+        b_fx: f32,
+        th_depth: f32,
+        camera: Arc<dyn GeometricCamera>,
+        prev_frame: Option<Arc<Frame>>,
+        imu_calib: Calib,
+    ) -> Self {
+        #[cfg(feature = "register-times")]
+        let time_start_ext_orb = std::time::Instant::now();
+
+        let res = extract_orb(extractor.as_ref(), im_gray, [0, 1000]);
+
+        #[cfg(feature = "register-times")]
+        let time_orb_ext = time_start_ext_orb.elapsed().as_secs_f64() * 1000.0;
+
+        let keys = res.keypoints;
+        let descriptors = res.descriptors.unwrap_or_default();
+        let n = keys.len();
+
+        let keys_un =
+            undistort_keypoints(&constants.dist_coef, &camera.to_k(), &constants.k, &keys);
+
+        // No stereo information for monocular.
+        let u_right = vec![-1.0f32; n];
+        let depth = vec![-1.0f32; n];
+
+        let b = b_fx / constants.intrinsics.fx;
+        let (grid, grid_right) =
+            assign_features_to_grid(n, None, &keys, None, Some(&keys_un), &constants.bounds);
+
+        Self::assemble(
+            FrameConfig {
+                orb_vocabulary,
+                extractor_left: extractor.clone(),
+                extractor_right: extractor,
+                timestamp,
+                constants,
+                b_fx,
+                b,
+                th_depth,
+                camera,
+                camera2: None,
+                imu_calib,
+                prev_frame,
+            },
+            ExtractedFrame {
+                keys,
+                keys_right: None,
+                keys_un: Some(keys_un),
+                descriptors,
+                descriptors_right: None,
+                u_right,
+                depth,
+                n,
+                n_left: None,
+                n_right: None,
+                mono_left: None,
+                mono_right: None,
+                left_to_right_match: None,
+                right_to_left_match: None,
+                stereo_3d_points: None,
+                grid,
+                grid_right,
+                close_mps: 0,
+                t_lr: Isometry3::identity(),
+                #[cfg(feature = "register-times")]
+                time_orb_ext,
+                #[cfg(feature = "register-times")]
+                time_stereo_match: 0.0,
+            },
+        )
+    }
+
+    /// Constructor for two-camera stereo fisheye (Kannala-Brandt) rigs.
+    ///
+    /// `t_lr` is the rigid transform mapping right-camera coordinates into the
+    /// left camera (Sophus `Tlr`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_stereo_fisheye(
+        im_left: &Mat,
+        im_right: &Mat,
+        timestamp: f64,
+        extractor_left: Arc<OrbExtractor>,
+        extractor_right: Arc<OrbExtractor>,
+        orb_vocabulary: Arc<OrbVocabulary>,
+        constants: Arc<FrameConstants>,
+        b_fx: f32,
+        th_depth: f32,
+        camera: Arc<dyn GeometricCamera>,
+        camera2: Arc<dyn GeometricCamera>,
+        t_lr: Isometry3<f32>,
+        prev_frame: Option<Arc<Frame>>,
+        imu_calib: Calib,
+    ) -> Self {
+        let lap_left = lapping_area(camera.as_ref());
+        let lap_right = lapping_area(camera2.as_ref());
+
+        #[cfg(feature = "register-times")]
+        let time_start_ext_orb = std::time::Instant::now();
+
+        let (left_res, right_res) = extract_orb_stereo(
+            extractor_left.as_ref(),
+            extractor_right.as_ref(),
+            im_left,
+            im_right,
+            lap_left,
+            lap_right,
+        );
+
+        #[cfg(feature = "register-times")]
+        let time_orb_ext = time_start_ext_orb.elapsed().as_secs_f64() * 1000.0;
+
+        let keys = left_res.keypoints;
+        let keys_right = right_res.keypoints;
+        let descriptors_left = left_res.descriptors.unwrap_or_default();
+        let descriptors_right = right_res.descriptors.unwrap_or_default();
+
+        let n_left = keys.len();
+        let n_right = keys_right.len();
+        let n = n_left + n_right;
+        let mono_left = left_res.mono_index.max(0) as usize;
+        let mono_right = right_res.mono_index.max(0) as usize;
+
+        let b = b_fx / constants.intrinsics.fx;
+        let t_rl = t_lr.inverse();
+
+        #[cfg(feature = "register-times")]
+        let time_start_stereo = std::time::Instant::now();
+
+        let scale_info = ScaleInfo::from_extractor(extractor_left.as_ref());
+        let fish = compute_stereo_fisheye_matches(
+            &keys,
+            &keys_right,
+            &descriptors_left,
+            &descriptors_right,
+            mono_left,
+            mono_right,
+            n_left,
+            n_right,
+            camera.as_ref(),
+            camera2.as_ref(),
+            &t_rl,
+            &scale_info.level_sigma2,
+        );
+
+        #[cfg(feature = "register-times")]
+        let time_stereo_match = time_start_stereo.elapsed().as_secs_f64() * 1000.0;
+
+        // Put all descriptors in the same matrix (left rows then right rows).
+        let mut descriptors = Mat::default();
+        vconcat2(&descriptors_left, &descriptors_right, &mut descriptors)
+            .expect("vconcat descriptors");
 
         let (grid, grid_right) = assign_features_to_grid(
             n,
-            None,
+            Some(n_left),
             &keys,
             Some(&keys_right),
-            Some(&keys_un),
+            None,
             &constants.bounds,
         );
 
+        Self::assemble(
+            FrameConfig {
+                orb_vocabulary,
+                extractor_left,
+                extractor_right,
+                timestamp,
+                constants,
+                b_fx,
+                b,
+                th_depth,
+                camera,
+                camera2: Some(camera2),
+                imu_calib,
+                prev_frame,
+            },
+            ExtractedFrame {
+                keys,
+                keys_right: Some(keys_right),
+                keys_un: None,
+                descriptors,
+                descriptors_right: Some(descriptors_right),
+                u_right: fish.u_right,
+                depth: fish.depth,
+                n,
+                n_left: Some(n_left),
+                n_right: Some(n_right),
+                mono_left: Some(mono_left),
+                mono_right: Some(mono_right),
+                left_to_right_match: Some(fish.left_to_right_match),
+                right_to_left_match: Some(fish.right_to_left_match),
+                stereo_3d_points: Some(fish.stereo_3d_points),
+                grid,
+                grid_right,
+                close_mps: 0,
+                t_lr,
+                #[cfg(feature = "register-times")]
+                time_orb_ext,
+                #[cfg(feature = "register-times")]
+                time_stereo_match,
+            },
+        )
+    }
+
+    /// Merge the shared config and the sensor-specific feature data into a
+    /// fully-initialised [`Frame`], filling in pose/velocity defaults.
+    fn assemble(cfg: FrameConfig, ext: ExtractedFrame) -> Self {
+        let scale = ScaleInfo::from_extractor(cfg.extractor_left.as_ref());
+
+        // Inherit velocity from the previous frame, like the C++ constructors.
+        let (vw, has_velocity) = match &cfg.prev_frame {
+            Some(pf) if pf.has_velocity => (pf.vw, true),
+            _ => (Vector3::zeros(), false),
+        };
+
+        // Stereo-fisheye relative pose (identity for every other sensor).
+        let t_rl = ext.t_lr.inverse();
+        let r_lr = ext.t_lr.rotation.to_rotation_matrix().into_inner();
+        let t_lr_vec = ext.t_lr.translation.vector;
+
         Frame {
             id: NEXT_ID.fetch_add(1, Ordering::SeqCst),
-            orb_vocabulary,
-            extractor_left,
-            extractor_right,
-            timestamp,
-            constants,
-            b_fx,
-            b,
-            th_depth,
-            imu_calib,
+            orb_vocabulary: cfg.orb_vocabulary,
+            extractor_left: cfg.extractor_left,
+            extractor_right: cfg.extractor_right,
+            timestamp: cfg.timestamp,
+            constants: cfg.constants,
+            b_fx: cfg.b_fx,
+            b: cfg.b,
+            th_depth: cfg.th_depth,
+            n: ext.n,
+            keys: ext.keys,
+            keys_right: ext.keys_right,
+            keys_un: ext.keys_un,
+            map_points: vec![None; ext.n],
+            u_right: ext.u_right,
+            depth: ext.depth,
+            bow_vec: BowVector::default(),
+            feat_vec: FeatureVector::default(),
+            descriptors: ext.descriptors,
+            descriptors_right: ext.descriptors_right,
+            outlier: vec![false; ext.n],
+            close_mps: ext.close_mps,
+            grid: ext.grid,
+            pred_bias: Bias::empty(),
+            imu_bias: Bias::empty(),
+            imu_calib: cfg.imu_calib,
             imu_preintegrated: None,
-            prev_frame,
+            last_keyframe: None,
+            prev_frame: cfg.prev_frame,
             imu_preintegrated_frame: None,
             reference_kf: None,
-            is_set: false,
-            is_imu_preintegrated: false,
-            camera,
-            camera2: None,
-            has_pose: false,
-            scale_levels,
-            scale_factor,
-            log_scale_factor,
-            scale_factors,
-            inv_scale_factors,
-            level_sigma2,
-            inv_level_sigma2,
+            scale_levels: scale.scale_levels,
+            scale_factor: scale.scale_factor,
+            log_scale_factor: scale.log_scale_factor,
+            scale_factors: scale.scale_factors,
+            inv_scale_factors: scale.inv_scale_factors,
+            level_sigma2: scale.level_sigma2,
+            inv_level_sigma2: scale.inv_level_sigma2,
+            project_points: HashMap::new(),
+            matched_in_image: HashMap::new(),
+            name_file: String::new(),
+            dataset: 0,
+            camera: cfg.camera,
+            camera2: cfg.camera2,
+            n_left: ext.n_left,
+            n_right: ext.n_right,
+            mono_left: ext.mono_left,
+            mono_right: ext.mono_right,
+            left_to_right_match: ext.left_to_right_match,
+            right_to_left_match: ext.right_to_left_match,
+            stereo_3d_points: ext.stereo_3d_points,
+            grid_right: ext.grid_right,
             #[cfg(feature = "register-times")]
-            time_orb_ext,
+            time_orb_ext: ext.time_orb_ext,
             #[cfg(feature = "register-times")]
-            time_stereo_match,
+            time_stereo_match: ext.time_stereo_match,
             cpi: None,
-            keys,
-            keys_right: Some(keys_right),
-            keys_un: Some(keys_un),
-            descriptors,
-            descriptors_right: Some(descriptors_right),
-            n,
-            map_points,
-            outlier,
-            project_points,
-            matched_in_image,
+            t_cw: Isometry3::identity(),
+            r_wc: Matrix3::identity(),
+            o_w: Vector3::zeros(),
+            r_cw: Matrix3::identity(),
+            t_cw_vec: Vector3::zeros(),
+            has_pose: false,
+            t_lr: ext.t_lr,
+            t_rl,
+            r_lr,
+            t_lr_vec,
             vw,
             has_velocity,
-            // Set no stereo fisheye information
-            n_left: None,
-            n_right: None,
-            mono_left: None,
-            mono_right: None,
-            left_to_right_match: None,
-            right_to_left_match: None,
-            stereo_3d_points: None,
-            // features assigned to grid
-            grid,
-            grid_right,
-            // TODO: here
+            is_set: false,
+            is_imu_preintegrated: AtomicFlag::new(false),
         }
     }
 
-    pub fn get_features_in_area(
-        &self,
-        x: f32,
-        y: f32,
-        r: f32,
-        min_level: i32, // default -1
-        max_level: i32, // default -1
-        right: bool,    // default false
-    ) -> Vec<usize> {
-        // TODO
-        Vec::new()
+    // --- Bag of Words ---------------------------------------------------
+
+    /// Compute the Bag-of-Words representation of the frame's descriptors.
+    pub fn compute_bow(&mut self) {
+        if self.bow_vec.is_empty() {
+            let descs = descriptors_to_array(&self.descriptors);
+            let (bow, feat) = self.orb_vocabulary.transform(&descs, 4);
+            self.bow_vec = bow;
+            self.feat_vec = feat;
+        }
+    }
+
+    // --- Pose -----------------------------------------------------------
+
+    /// Set the camera pose `Tcw`. The IMU pose is not modified.
+    pub fn set_pose(&mut self, t_cw: Isometry3<f32>) {
+        self.t_cw = t_cw;
+        self.update_pose_matrices();
+        self.is_set = true;
+        self.has_pose = true;
+    }
+
+    /// Set IMU pose (`Rwb`, `twb`) and velocity, implicitly setting the camera pose.
+    pub fn set_imu_pose_velocity(
+        &mut self,
+        r_wb: Matrix3<f32>,
+        t_wb: Vector3<f32>,
+        v_wb: Vector3<f32>,
+    ) {
+        self.vw = v_wb;
+        self.has_velocity = true;
+
+        let rotation = nalgebra::UnitQuaternion::from_rotation_matrix(
+            &nalgebra::Rotation3::from_matrix_unchecked(r_wb),
+        );
+        let t_wb = Isometry3::from_parts(t_wb.into(), rotation);
+        let t_bw = t_wb.inverse();
+        self.t_cw = self.imu_calib.tcb * t_bw;
+        self.update_pose_matrices();
+        self.is_set = true;
+        self.has_pose = true;
+    }
+
+    /// Recompute rotation, translation and camera-center matrices from `Tcw`.
+    fn update_pose_matrices(&mut self) {
+        let t_wc = self.t_cw.inverse();
+        self.r_wc = t_wc.rotation.to_rotation_matrix().into_inner();
+        self.o_w = t_wc.translation.vector;
+        self.r_cw = self.t_cw.rotation.to_rotation_matrix().into_inner();
+        self.t_cw_vec = self.t_cw.translation.vector;
     }
 
     pub fn get_pose(&self) -> Isometry3<f32> {
         self.t_cw
     }
+    pub fn has_pose(&self) -> bool {
+        self.has_pose
+    }
+    pub fn is_set(&self) -> bool {
+        self.is_set
+    }
+    /// Camera center in world coordinates (`mOw`).
+    pub fn get_camera_center(&self) -> Vector3<f32> {
+        self.o_w
+    }
+    /// Inverse of the rotation (`mRwc`).
+    pub fn get_rotation_inverse(&self) -> Matrix3<f32> {
+        self.r_wc
+    }
+    pub fn get_rwc(&self) -> Matrix3<f32> {
+        self.r_wc
+    }
+    pub fn get_ow(&self) -> Vector3<f32> {
+        self.o_w
+    }
+
+    // --- Velocity -------------------------------------------------------
+
+    pub fn set_velocity(&mut self, v_wb: Vector3<f32>) {
+        self.vw = v_wb;
+        self.has_velocity = true;
+    }
+    pub fn get_velocity(&self) -> Vector3<f32> {
+        self.vw
+    }
+    pub fn has_velocity(&self) -> bool {
+        self.has_velocity
+    }
+
+    // --- IMU ------------------------------------------------------------
+
+    /// IMU position in world coordinates.
+    pub fn get_imu_position(&self) -> Vector3<f32> {
+        self.r_wc * self.imu_calib.tcb.translation.vector + self.o_w
+    }
+    /// IMU rotation in world coordinates.
+    pub fn get_imu_rotation(&self) -> Matrix3<f32> {
+        self.r_wc
+            * self
+                .imu_calib
+                .tcb
+                .rotation
+                .to_rotation_matrix()
+                .into_inner()
+    }
+    /// IMU pose (`Twb`-style `Tcw⁻¹ · Tcb`).
+    pub fn get_imu_pose(&self) -> Isometry3<f32> {
+        self.t_cw.inverse() * self.imu_calib.tcb
+    }
+
+    pub fn set_new_bias(&mut self, b: Bias) {
+        self.imu_bias = b;
+        if let Some(preint) = self.imu_preintegrated.as_ref() {
+            // `Preintegrated` mutation through a shared `Arc` is part of the
+            // wider interior-mutability decision; this is a no-op stub until then.
+            let _ = preint;
+        }
+    }
+
+    pub fn imu_is_preintegrated(&self) -> bool {
+        self.is_imu_preintegrated.get()
+    }
+    /// Mark the frame's IMU measurements as preintegrated.
+    ///
+    /// Takes `&self`: the [`AtomicFlag`] gives interior mutability so
+    /// LocalMapping can publish this through a shared `Arc<Frame>` without a
+    /// lock or exclusive borrow.
+    pub fn set_integrated(&self) {
+        self.is_imu_preintegrated.set(true);
+    }
+
+    // --- Relative stereo pose ------------------------------------------
+
     pub fn get_relative_pose_trl(&self) -> Isometry3<f32> {
         self.t_rl
+    }
+    pub fn get_relative_pose_tlr(&self) -> Isometry3<f32> {
+        self.t_lr
+    }
+    pub fn get_relative_pose_tlr_rotation(&self) -> Matrix3<f32> {
+        self.r_lr
+    }
+    pub fn get_relative_pose_tlr_translation(&self) -> Vector3<f32> {
+        self.t_lr_vec
+    }
+
+    // --- Projection / geometry -----------------------------------------
+
+    /// Transform a world point into this frame's camera coordinates.
+    pub fn in_ref_coordinates(&self, p_cw: Vector3<f32>) -> Vector3<f32> {
+        self.r_cw * p_cw + self.t_cw_vec
+    }
+
+    /// Check whether a [`MapPoint`] falls in the camera frustum and, if so,
+    /// return the projection data for the left and/or right camera.
+    ///
+    /// Unlike the C++ version this does not mutate the `MapPoint`.
+    pub fn is_in_frustum(&self, mp: &MapPoint, viewing_cos_limit: f32) -> FrustumResult {
+        if self.n_left.is_none() {
+            // Pinhole / rectified-stereo path.
+            let p = mp.get_world_pos();
+            let pc = self.r_cw * p + self.t_cw_vec;
+            let pc_dist = pc.norm();
+            let pcz = pc.z;
+            if pcz < 0.0 {
+                return FrustumResult::default();
+            }
+            let invz = 1.0 / pcz;
+
+            let uv = self.camera.project_n(&Point3::from(pc));
+            let bounds = &self.constants.bounds;
+            if uv.x < bounds.min_x || uv.x > bounds.max_x {
+                return FrustumResult::default();
+            }
+            if uv.y < bounds.min_y || uv.y > bounds.max_y {
+                return FrustumResult::default();
+            }
+
+            let max_distance = mp.get_max_distance_invariance();
+            let min_distance = mp.get_min_distance_invariance();
+            let po = p - self.o_w;
+            let dist = po.norm();
+            if dist < min_distance || dist > max_distance {
+                return FrustumResult::default();
+            }
+
+            let pn = mp.get_normal();
+            let view_cos = po.dot(&pn) / dist;
+            if view_cos < viewing_cos_limit {
+                return FrustumResult::default();
+            }
+
+            let predicted_level = mp.predict_scale(dist, self) as i32;
+            FrustumResult {
+                left: Some(TrackInfo {
+                    proj_x: uv.x,
+                    proj_y: uv.y,
+                    proj_xr: uv.x - self.b_fx * invz,
+                    depth: pc_dist,
+                    scale_level: predicted_level,
+                    view_cos,
+                }),
+                right: None,
+            }
+        } else {
+            // Stereo-fisheye path: check both cameras.
+            FrustumResult {
+                left: self.is_in_frustum_checks(mp, viewing_cos_limit, false),
+                right: self.is_in_frustum_checks(mp, viewing_cos_limit, true),
+            }
+        }
+    }
+
+    /// Frustum check against a single camera of a stereo-fisheye rig.
+    fn is_in_frustum_checks(
+        &self,
+        mp: &MapPoint,
+        viewing_cos_limit: f32,
+        right: bool,
+    ) -> Option<TrackInfo> {
+        let p = mp.get_world_pos();
+
+        let (rotation, translation, twc, cam): (
+            Matrix3<f32>,
+            Vector3<f32>,
+            Vector3<f32>,
+            &dyn GeometricCamera,
+        ) = if right {
+            let rrl = self.t_rl.rotation.to_rotation_matrix().into_inner();
+            let trl = self.t_rl.translation.vector;
+            (
+                rrl * self.r_cw,
+                rrl * self.t_cw_vec + trl,
+                self.r_wc * self.t_lr_vec + self.o_w,
+                self.camera2
+                    .as_deref()
+                    .expect("camera2 for fisheye right check"),
+            )
+        } else {
+            (self.r_cw, self.t_cw_vec, self.o_w, self.camera.as_ref())
+        };
+
+        let pc = rotation * p + translation;
+        let pc_dist = pc.norm();
+        if pc.z < 0.0 {
+            return None;
+        }
+
+        let uv = cam.project_n(&Point3::from(pc));
+        let bounds = &self.constants.bounds;
+        if uv.x < bounds.min_x || uv.x > bounds.max_x {
+            return None;
+        }
+        if uv.y < bounds.min_y || uv.y > bounds.max_y {
+            return None;
+        }
+
+        let max_distance = mp.get_max_distance_invariance();
+        let min_distance = mp.get_min_distance_invariance();
+        let po = p - twc;
+        let dist = po.norm();
+        if dist < min_distance || dist > max_distance {
+            return None;
+        }
+
+        let pn = mp.get_normal();
+        let view_cos = po.dot(&pn) / dist;
+        if view_cos < viewing_cos_limit {
+            return None;
+        }
+
+        let predicted_level = mp.predict_scale(dist, self) as i32;
+        Some(TrackInfo {
+            proj_x: uv.x,
+            proj_y: uv.y,
+            proj_xr: uv.x,
+            depth: pc_dist,
+            scale_level: predicted_level,
+            view_cos,
+        })
+    }
+
+    /// Project a [`MapPoint`] applying OpenCV radial-tangential distortion.
+    /// Returns the distorted image point, or `None` if behind / outside.
+    pub fn project_point_distort(&self, mp: &MapPoint) -> Option<Point2f> {
+        let intr = &self.constants.intrinsics;
+        let p = mp.get_world_pos();
+        let pc = self.r_cw * p + self.t_cw_vec;
+        if pc.z < 0.0 {
+            return None;
+        }
+
+        let invz = 1.0 / pc.z;
+        let u = intr.fx * pc.x * invz + intr.cx;
+        let v = intr.fy * pc.y * invz + intr.cy;
+
+        let bounds = &self.constants.bounds;
+        if u < bounds.min_x || u > bounds.max_x {
+            return None;
+        }
+        if v < bounds.min_y || v > bounds.max_y {
+            return None;
+        }
+
+        let x = (u - intr.cx) * intr.invfx;
+        let y = (v - intr.cy) * intr.invfy;
+        let r2 = x * x + y * y;
+
+        let dist = &self.constants.dist_coef;
+        let k1 = *dist.at::<f32>(0).expect("k1");
+        let k2 = *dist.at::<f32>(1).expect("k2");
+        let p1 = *dist.at::<f32>(2).expect("p1");
+        let p2 = *dist.at::<f32>(3).expect("p2");
+        let k3 = if dist.total() == 5 {
+            *dist.at::<f32>(4).expect("k3")
+        } else {
+            0.0
+        };
+
+        let radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2;
+        let x_distort = x * radial + (2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x));
+        let y_distort = y * radial + (p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y);
+
+        Some(Point2f::new(
+            x_distort * intr.fx + intr.cx,
+            y_distort * intr.fy + intr.cy,
+        ))
+    }
+
+    /// Backproject keypoint `i` into 3D world coordinates, if it has valid depth.
+    pub fn unproject_stereo(&self, i: usize) -> Option<Vector3<f32>> {
+        let z = self.depth[i];
+        if z > 0.0 {
+            let intr = &self.constants.intrinsics;
+            let kp = &self.keys_un.as_ref().expect("keys_un for unproject")[i];
+            let u = kp.pt().x;
+            let v = kp.pt().y;
+            let x = (u - intr.cx) * z * intr.invfx;
+            let y = (v - intr.cy) * z * intr.invfy;
+            Some(self.r_wc * Vector3::new(x, y, z) + self.o_w)
+        } else {
+            None
+        }
+    }
+
+    /// Backproject a stereo-fisheye match (already triangulated in the left frame).
+    pub fn unproject_stereo_fisheye(&self, i: usize) -> Vector3<f32> {
+        let pts = self
+            .stereo_3d_points
+            .as_ref()
+            .expect("stereo_3d_points for fisheye unproject");
+        self.r_wc * pts[i] + self.o_w
+    }
+
+    // --- Feature grid ---------------------------------------------------
+
+    /// Indices of features whose cells overlap a circle of radius `r` around
+    /// `(x, y)`, optionally restricted to a scale-level band and to the right
+    /// image (stereo fisheye).
+    pub fn get_features_in_area(
+        &self,
+        x: f32,
+        y: f32,
+        r: f32,
+        min_level: i32,
+        max_level: i32,
+        right: bool,
+    ) -> Vec<usize> {
+        let mut indices = Vec::with_capacity(self.n);
+        let bounds = &self.constants.bounds;
+
+        let min_cell_x = (((x - bounds.min_x - r) * bounds.grid_w_inv).floor() as i32).max(0);
+        if min_cell_x >= FRAME_GRID_COLS as i32 {
+            return indices;
+        }
+        let max_cell_x = (((x - bounds.min_x + r) * bounds.grid_w_inv).ceil() as i32)
+            .min(FRAME_GRID_COLS as i32 - 1);
+        if max_cell_x < 0 {
+            return indices;
+        }
+        let min_cell_y = (((y - bounds.min_y - r) * bounds.grid_h_inv).floor() as i32).max(0);
+        if min_cell_y >= FRAME_GRID_ROWS as i32 {
+            return indices;
+        }
+        let max_cell_y = (((y - bounds.min_y + r) * bounds.grid_h_inv).ceil() as i32)
+            .min(FRAME_GRID_ROWS as i32 - 1);
+        if max_cell_y < 0 {
+            return indices;
+        }
+
+        let check_levels = (min_level > 0) || (max_level >= 0);
+        let grid = if right { &self.grid_right } else { &self.grid };
+
+        for ix in min_cell_x..=max_cell_x {
+            for iy in min_cell_y..=max_cell_y {
+                let cell = &grid[grid_index(ix as usize, iy as usize)];
+                for &j in cell {
+                    let kp = self.keypoint_for_area(j, right);
+                    if check_levels {
+                        let octave = kp.octave();
+                        if octave < min_level {
+                            continue;
+                        }
+                        if max_level >= 0 && octave > max_level {
+                            continue;
+                        }
+                    }
+                    let distx = kp.pt().x - x;
+                    let disty = kp.pt().y - y;
+                    if distx.abs() < r && disty.abs() < r {
+                        indices.push(j);
+                    }
+                }
+            }
+        }
+        indices
+    }
+
+    /// Keypoint used by [`Self::get_features_in_area`]: undistorted for the
+    /// pinhole/rectified case, raw left/right keys for stereo fisheye.
+    fn keypoint_for_area(&self, idx: usize, right: bool) -> &KeyPoint {
+        match self.n_left {
+            None => &self.keys_un.as_ref().expect("keys_un")[idx],
+            Some(_) if !right => &self.keys[idx],
+            Some(_) => &self.keys_right.as_ref().expect("keys_right")[idx],
+        }
     }
 }
 
@@ -466,10 +1396,7 @@ fn compute_image_bounds(
     image_cols: i32,
     image_rows: i32,
 ) -> Result<(f32, f32, f32, f32), FrameConstantsError> {
-    let has_distortion =
-        !dist_coef.empty() && dist_coef.at::<f32>(0).map(|v| *v != 0.0).unwrap_or(false);
-
-    if !has_distortion {
+    if !has_distortion(dist_coef) {
         return Ok((0.0, image_cols as f32, 0.0, image_rows as f32));
     }
 
@@ -504,21 +1431,56 @@ fn compute_image_bounds(
     ))
 }
 
-fn bf_matcher() -> BFMatcher {
-    BFMatcher::new(NORM_HAMMING, false).unwrap()
+/// Whether the OpenCV distortion vector actually carries distortion.
+fn has_distortion(dist_coef: &Mat) -> bool {
+    !dist_coef.empty() && dist_coef.at::<f32>(0).map(|v| *v != 0.0).unwrap_or(false)
 }
 
-/// Run ORB extraction on a single image
-fn extract_orb(
+/// The Kannala-Brandt lapping (stereo overlap) area `[x0, x1]` for a camera.
+fn lapping_area(camera: &dyn GeometricCamera) -> [i32; 2] {
+    let kb = camera
+        .as_any()
+        .downcast_ref::<KannalaBrandt8>()
+        .expect("fisheye frame requires a KannalaBrandt8 camera");
+    [kb.lapping_area[0] as i32, kb.lapping_area[1] as i32]
+}
+
+/// Run ORB extraction on a single image.
+fn extract_orb(extractor: &OrbExtractor, im: &Mat, lapping: [i32; 2]) -> OrbExtractResult {
+    extract_orb_result(extractor, im, lapping).expect("ORB extraction failed")
+}
+
+fn extract_orb_result(
     extractor: &OrbExtractor,
     im: &Mat,
-    x0: i32,
-    x1: i32,
+    lapping: [i32; 2],
 ) -> Result<OrbExtractResult, ExtractionError> {
-    let lapping = [x0, x1];
     extractor.compute(im, &Mat::default(), lapping)
 }
 
+/// Extract ORB on the left and right images in parallel.
+fn extract_orb_stereo(
+    extractor_left: &OrbExtractor,
+    extractor_right: &OrbExtractor,
+    im_left: &Mat,
+    im_right: &Mat,
+    lap_left: [i32; 2],
+    lap_right: [i32; 2],
+) -> (OrbExtractResult, OrbExtractResult) {
+    let (left, right) = std::thread::scope(|s| {
+        let left_handle = s.spawn(|| extract_orb_result(extractor_left, im_left, lap_left));
+        let right = extract_orb_result(extractor_right, im_right, lap_right);
+        let left = left_handle.join().expect("left ORB thread panicked");
+        (left, right)
+    });
+    (
+        left.expect("left ORB extraction failed"),
+        right.expect("right ORB extraction failed"),
+    )
+}
+
+/// Grid cell of a keypoint, or `None` if its undistorted position falls
+/// outside the grid.
 pub fn pos_in_grid(kp: &KeyPoint, bounds: &ImageBounds) -> Option<(usize, usize)> {
     let pt = kp.pt();
     let pos_x = ((pt.x - bounds.min_x) * bounds.grid_w_inv).round() as i32;
@@ -532,10 +1494,12 @@ pub fn pos_in_grid(kp: &KeyPoint, bounds: &ImageBounds) -> Option<(usize, usize)
     }
     Some((pos_x as usize, pos_y as usize))
 }
+
 #[inline]
 pub fn grid_index(col: usize, row: usize) -> usize {
     col * FRAME_GRID_ROWS + row
 }
+
 fn assign_features_to_grid(
     n: usize,
     n_left: Option<usize>,
@@ -554,6 +1518,8 @@ fn assign_features_to_grid(
         Vec::new()
     };
 
+    // Index-based: the keypoint source (left / right / undistorted) depends on `i`.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         let kp = match n_left {
             None => &keys_un.expect("keys_un required for non-fisheye frames")[i],
@@ -575,18 +1541,21 @@ fn assign_features_to_grid(
     (grid, grid_right)
 }
 
+/// Undistort the raw keypoints using the OpenCV distortion model. Returns a
+/// copy of `keys` unchanged when there is no distortion (rectified / fisheye).
 fn undistort_keypoints(
-    n: i32,
     dist_coef: &Mat,
     camera_k: &Mat,
     k: &Mat,
     keys: &[KeyPoint],
 ) -> Vec<KeyPoint> {
-    if *dist_coef.at::<f32>(0).expect("get dist_coef") == 0. {
+    if !has_distortion(dist_coef) {
         return keys.to_vec();
     }
 
-    // Fill matrix with points
+    let n = keys.len() as i32;
+
+    // Fill matrix with points.
     let mut mat =
         Mat::new_rows_cols_with_default(n, 2, CV_32F, Scalar::default()).expect("create mat");
     for (i, kp) in keys.iter().enumerate() {
@@ -620,10 +1589,322 @@ fn undistort_keypoints(
     keys_un
 }
 
-fn compute_stereo_matches(n: usize) {
-    let u_right = vec![-1.0f32; n];
-    let depth = vec![-1.0f32; n];
+/// Search a match for each left keypoint in the right (rectified) image,
+/// returning `(u_right, depth)` per left keypoint (`-1` when unmatched).
+#[allow(clippy::too_many_arguments)]
+fn compute_stereo_matches(
+    keys: &[KeyPoint],
+    keys_right: &[KeyPoint],
+    descriptors: &Mat,
+    descriptors_right: &Mat,
+    left_pyramid: &[Mat],
+    right_pyramid: &[Mat],
+    scale_factors: &[f32],
+    inv_scale_factors: &[f32],
+    mb: f32,
+    b_fx: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let n = keys.len();
+    let mut u_right = vec![-1.0f32; n];
+    let mut depth = vec![-1.0f32; n];
 
-    let th_orb_dist = 0; // TODO
-    // TODO
+    let th_orb_dist = (TH_HIGH + TH_LOW) / 2;
+    let n_rows = left_pyramid[0].rows();
+    if n_rows <= 0 {
+        return (u_right, depth);
+    }
+
+    // Assign right keypoints to a row table.
+    let mut row_indices: Vec<Vec<usize>> = vec![Vec::with_capacity(200); n_rows as usize];
+    for (i_r, kp) in keys_right.iter().enumerate() {
+        let kp_y = kp.pt().y;
+        let r = 2.0 * scale_factors[kp.octave() as usize];
+        let max_r = (kp_y + r).ceil() as i32;
+        let min_r = (kp_y - r).floor() as i32;
+        for yi in min_r.max(0)..=max_r.min(n_rows - 1) {
+            row_indices[yi as usize].push(i_r);
+        }
+    }
+
+    // Search limits.
+    let min_z = mb;
+    let min_d = 0.0;
+    let max_d = b_fx / min_z;
+
+    // (best_dist, left_index) for the median-based outlier rejection pass.
+    let mut dist_idx: Vec<(i32, usize)> = Vec::with_capacity(n);
+
+    for i_l in 0..n {
+        let kp_l = &keys[i_l];
+        let level_l = kp_l.octave();
+        let v_l = kp_l.pt().y;
+        let u_l = kp_l.pt().x;
+
+        let candidates = &row_indices[v_l.round().clamp(0.0, (n_rows - 1) as f32) as usize];
+        if candidates.is_empty() {
+            continue;
+        }
+
+        let min_u = u_l - max_d;
+        let max_u = u_l - min_d;
+        if max_u < 0.0 {
+            continue;
+        }
+
+        let mut best_dist = TH_HIGH;
+        let mut best_idx_r = 0usize;
+        let d_l = descriptors.row(i_l as i32).expect("left descriptor row");
+
+        for &i_r in candidates {
+            let kp_r = &keys_right[i_r];
+            if kp_r.octave() < level_l - 1 || kp_r.octave() > level_l + 1 {
+                continue;
+            }
+            let u_r = kp_r.pt().x;
+            if u_r >= min_u && u_r <= max_u {
+                let d_r = descriptors_right
+                    .row(i_r as i32)
+                    .expect("right descriptor row");
+                let dist = descriptor_distance(&d_l, &d_r);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_idx_r = i_r;
+                }
+            }
+        }
+
+        if best_dist >= th_orb_dist {
+            continue;
+        }
+
+        // Subpixel match by sliding-window correlation at the keypoint's scale.
+        let u_r0 = keys_right[best_idx_r].pt().x;
+        let scale = inv_scale_factors[kp_l.octave() as usize];
+        let scaled_u_l = (kp_l.pt().x * scale).round();
+        let scaled_v_l = (kp_l.pt().y * scale).round();
+        let scaled_u_r0 = (u_r0 * scale).round();
+
+        let w = 5;
+        let level = kp_l.octave() as usize;
+        let Some(il) = roi_window(&left_pyramid[level], scaled_u_l, scaled_v_l, w) else {
+            continue;
+        };
+
+        let big_l = 5;
+        let mut dists = vec![0.0f32; (2 * big_l + 1) as usize];
+        let ini_u = scaled_u_r0 + big_l as f32 - w as f32;
+        let end_u = scaled_u_r0 + big_l as f32 + w as f32 + 1.0;
+        if ini_u < 0.0 || end_u >= right_pyramid[level].cols() as f32 {
+            continue;
+        }
+
+        let mut best_corr = f32::MAX;
+        let mut best_inc_r = 0i32;
+        for inc_r in -big_l..=big_l {
+            let Some(ir) = roi_window(
+                &right_pyramid[level],
+                scaled_u_r0 + inc_r as f32,
+                scaled_v_l,
+                w,
+            ) else {
+                continue;
+            };
+            let dist = norm2(&il, &ir, NORM_L1, &Mat::default()).expect("norm L1") as f32;
+            if dist < best_corr {
+                best_corr = dist;
+                best_inc_r = inc_r;
+            }
+            dists[(big_l + inc_r) as usize] = dist;
+        }
+
+        if best_inc_r == -big_l || best_inc_r == big_l {
+            continue;
+        }
+
+        // Sub-pixel match (parabola fitting).
+        let dist1 = dists[(big_l + best_inc_r - 1) as usize];
+        let dist2 = dists[(big_l + best_inc_r) as usize];
+        let dist3 = dists[(big_l + best_inc_r + 1) as usize];
+        let denom = 2.0 * (dist1 + dist3 - 2.0 * dist2);
+        if denom == 0.0 {
+            continue;
+        }
+        let delta_r = (dist1 - dist3) / denom;
+        if !(-1.0..=1.0).contains(&delta_r) {
+            continue;
+        }
+
+        // Re-scaled coordinate.
+        let mut best_u_r =
+            scale_factors[kp_l.octave() as usize] * (scaled_u_r0 + best_inc_r as f32 + delta_r);
+        let mut disparity = u_l - best_u_r;
+        if disparity >= min_d && disparity < max_d {
+            if disparity <= 0.0 {
+                disparity = 0.01;
+                best_u_r = u_l - 0.01;
+            }
+            depth[i_l] = b_fx / disparity;
+            u_right[i_l] = best_u_r;
+            dist_idx.push((best_corr as i32, i_l));
+        }
+    }
+
+    // Reject matches whose correlation is far above the median.
+    if dist_idx.is_empty() {
+        return (u_right, depth);
+    }
+    dist_idx.sort_unstable();
+    let median = dist_idx[dist_idx.len() / 2].0 as f32;
+    let th_dist = 1.5 * 1.4 * median;
+    for &(dist, i_l) in dist_idx.iter().rev() {
+        if (dist as f32) < th_dist {
+            break;
+        }
+        u_right[i_l] = -1.0;
+        depth[i_l] = -1.0;
+    }
+
+    (u_right, depth)
+}
+
+/// Extract a `(2w+1)×(2w+1)` window centred on `(cx, cy)`, or `None` if it
+/// would fall outside the image.
+fn roi_window(img: &Mat, cx: f32, cy: f32, w: i32) -> Option<opencv::boxed_ref::BoxedRef<'_, Mat>> {
+    let x = cx as i32 - w;
+    let y = cy as i32 - w;
+    let side = 2 * w + 1;
+    if x < 0 || y < 0 || x + side > img.cols() || y + side > img.rows() {
+        return None;
+    }
+    Mat::roi(img, Rect::new(x, y, side, side)).ok()
+}
+
+/// Associate a right coordinate and depth to each keypoint from a depth map.
+fn compute_stereo_from_rgbd(
+    keys: &[KeyPoint],
+    keys_un: &[KeyPoint],
+    im_depth: &Mat,
+    b_fx: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let n = keys.len();
+    let mut u_right = vec![-1.0f32; n];
+    let mut depth = vec![-1.0f32; n];
+
+    for (i, (kp, kp_u)) in keys.iter().zip(keys_un).enumerate() {
+        let v = kp.pt().y as i32;
+        let u = kp.pt().x as i32;
+        let d = *im_depth.at_2d::<f32>(v, u).expect("depth lookup");
+        if d > 0.0 {
+            depth[i] = d;
+            u_right[i] = kp_u.pt().x - b_fx / d;
+        }
+    }
+    (u_right, depth)
+}
+
+/// Convert an `N×32` `CV_8U` descriptor matrix into per-row [`Descriptor`]s
+/// for the vocabulary transform.
+fn descriptors_to_array(descriptors: &Mat) -> Vec<Descriptor> {
+    let rows = descriptors.rows();
+    let mut out = Vec::with_capacity(rows as usize);
+    for i in 0..rows {
+        let row = descriptors.row(i).expect("descriptor row");
+        let bytes = row.data_bytes().expect("descriptor bytes");
+        let mut d: Descriptor = [0u8; DESC_LEN];
+        d.copy_from_slice(&bytes[..DESC_LEN]);
+        out.push(d);
+    }
+    out
+}
+
+/// Output of [`compute_stereo_fisheye_matches`].
+struct FisheyeMatches {
+    left_to_right_match: Vec<usize>,
+    right_to_left_match: Vec<usize>,
+    u_right: Vec<f32>,
+    depth: Vec<f32>,
+    stereo_3d_points: Vec<Vector3<f32>>,
+}
+
+/// Brute-force match left↔right keypoints in the lapping area of a fisheye
+/// rig and triangulate the good matches in the left-camera frame.
+#[allow(clippy::too_many_arguments)]
+fn compute_stereo_fisheye_matches(
+    keys: &[KeyPoint],
+    keys_right: &[KeyPoint],
+    descriptors_left: &Mat,
+    descriptors_right: &Mat,
+    mono_left: usize,
+    mono_right: usize,
+    n_left: usize,
+    n_right: usize,
+    camera: &dyn GeometricCamera,
+    camera2: &dyn GeometricCamera,
+    t_rl: &Isometry3<f32>,
+    level_sigma2: &[f32],
+) -> FisheyeMatches {
+    let mut left_to_right_match = vec![usize::MAX; n_left];
+    let mut right_to_left_match = vec![usize::MAX; n_right];
+    let u_right = vec![-1.0f32; n_left];
+    let mut depth = vec![-1.0f32; n_left];
+    let mut stereo_3d_points = vec![Vector3::zeros(); n_left];
+
+    // Only the lapping-area descriptors participate in stereo matching.
+    let stereo_desc_left = descriptors_left
+        .row_range(&opencv::core::Range::new(mono_left as i32, descriptors_left.rows()).unwrap())
+        .expect("left stereo descriptors");
+    let stereo_desc_right = descriptors_right
+        .row_range(&opencv::core::Range::new(mono_right as i32, descriptors_right.rows()).unwrap())
+        .expect("right stereo descriptors");
+
+    let matcher = BFMatcher::new(NORM_HAMMING, false).expect("BFMatcher");
+    let mut matches: Vector<Vector<DMatch>> = Vector::new();
+    matcher
+        .knn_train_match_def(&stereo_desc_left, &stereo_desc_right, &mut matches, 2)
+        .expect("knn match");
+
+    let identity = Isometry3::identity();
+    for pair in matches.iter() {
+        if pair.len() < 2 {
+            continue;
+        }
+        let m0 = pair.get(0).unwrap();
+        let m1 = pair.get(1).unwrap();
+        // Lowe's ratio test.
+        if m0.distance >= m1.distance * 0.7 {
+            continue;
+        }
+
+        let left_idx = m0.query_idx as usize + mono_left;
+        let right_idx = m0.train_idx as usize + mono_right;
+        let sigma1 = level_sigma2[keys[left_idx].octave() as usize];
+        let sigma2 = level_sigma2[keys_right[right_idx].octave() as usize];
+
+        // Triangulate with the left camera as the world reference.
+        if let Some(p3d) = camera.match_and_triangulate(
+            &keys[left_idx],
+            &keys_right[right_idx],
+            camera2,
+            &identity,
+            t_rl,
+            sigma1,
+            sigma2,
+        ) {
+            let z = p3d.z;
+            if z > 0.0001 {
+                left_to_right_match[left_idx] = right_idx;
+                right_to_left_match[right_idx] = left_idx;
+                stereo_3d_points[left_idx] = p3d;
+                depth[left_idx] = z;
+            }
+        }
+    }
+
+    FisheyeMatches {
+        left_to_right_match,
+        right_to_left_match,
+        u_right,
+        depth,
+        stereo_3d_points,
+    }
 }

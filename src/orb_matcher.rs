@@ -1,6 +1,7 @@
+use opencv::core::KeyPoint;
 use opencv::prelude::*;
-use std::collections::HashSet;
 use std::sync::Arc;
+use std::{cmp::Ordering, collections::HashSet};
 
 use crate::frame::Frame;
 use crate::key_frame::KeyFrame;
@@ -185,8 +186,6 @@ impl OrbMatcher {
                     let x_3dw = mp.get_world_pos();
                     let x_3dc = t_cw * x_3dw;
 
-                    let xc = x_3dc[0];
-                    let yc = x_3dc[1];
                     let inv_zc = 1.0 / x_3dc[2];
 
                     if inv_zc < 0. {
@@ -588,12 +587,6 @@ impl OrbMatcher {
     ) -> i32 {
         let mut n_matches = 0;
 
-        // Get calibration parameters for later projection
-        let fx = kf.fx;
-        let fy = kf.fy;
-        let cx = kf.cx;
-        let cy = kf.cy;
-
         let t_cw = Isometry3::from_parts(
             Translation3::from(scw.isometry.translation.vector / scw.scaling()),
             scw.isometry.rotation,
@@ -661,7 +654,7 @@ impl OrbMatcher {
             let d_mp = mp.get_descriptor();
 
             let mut best_dist = 256;
-            let mut best_idx = 0;
+            let mut best_idx: i32 = -1;
 
             for idx in indices {
                 if matched[idx].is_some() {
@@ -675,12 +668,12 @@ impl OrbMatcher {
                 let dist = descriptor_distance(&d_mp, &d_kf);
                 if dist < best_dist {
                     best_dist = dist;
-                    best_idx = idx;
+                    best_idx = idx as i32;
                 }
             }
 
             if best_dist <= (TH_LOW as f32 * ratio_hamming) as i32 {
-                matched[best_idx] = Some(mp.clone());
+                matched[best_idx as usize] = Some(mp.clone());
                 n_matches += 1;
             }
         }
@@ -780,7 +773,7 @@ impl OrbMatcher {
             let d_mp = mp.get_descriptor();
 
             let mut best_dist = 256;
-            let mut best_idx = 0;
+            let mut best_idx: i32 = -1;
 
             for idx in indices {
                 if matched[idx].is_some() {
@@ -794,14 +787,362 @@ impl OrbMatcher {
                 let dist = descriptor_distance(&d_mp, &d_kf);
                 if dist < best_dist {
                     best_dist = dist;
-                    best_idx = idx;
+                    best_idx = idx as i32;
                 }
             }
 
             if best_dist <= (TH_LOW as f32 * ratio_hamming) as i32 {
-                matched[best_idx] = Some(mp.clone());
-                matched_kf[best_idx] = Some(kfi.clone());
+                matched[best_idx as usize] = Some(mp.clone());
+                matched_kf[best_idx as usize] = Some(kfi.clone());
                 n_matches += 1;
+            }
+        }
+
+        n_matches
+    }
+
+    // Search matches between MapPoints in a KeyFrame and ORB in a Frame.
+    // Brute force constrained to ORB that belong to the same vocabulary node (at a certain level)
+    // Used in Relocalisation and Loop Detection
+    fn search_by_bow_frame(
+        &self,
+        kf: &KeyFrame,
+        f: &Frame,
+        mappoint_matches: &mut Vec<Option<Arc<MapPoint>>>,
+    ) -> i32 {
+        let mut n_matches = 0;
+
+        let map_points_kf = kf.get_map_point_matches();
+
+        // Output is index-aligned with the Frame's keypoints.
+        mappoint_matches.clear();
+        mappoint_matches.resize(f.n, None);
+
+        let feat_vec_kf = &kf.feat_vec;
+
+        // Rotation Histogram (to check rotation consistency)
+        let mut rot_hist: [Vec<usize>; HISTO_LENGTH] =
+            std::array::from_fn(|_| Vec::with_capacity(500));
+        let factor = 1.0 / HISTO_LENGTH as f32;
+
+        // Select the KeyFrame keypoint for index `idx`
+        let kf_keypoint = |idx: usize| -> &KeyPoint {
+            if kf.camera2.is_none() {
+                &kf.keys_un[idx]
+            } else if let Some(n_left) = kf.n_left
+                && idx >= n_left
+            {
+                &kf.keys_right.as_ref().expect("keys_right")[idx - n_left]
+            } else {
+                &kf.keys[idx]
+            }
+        };
+
+        // Frame keypoint for a *left* match: uses the KeyFrame's second camera
+        // flag, matching `(!pKF->mpCamera2 || F.Nleft == -1) ? F.mvKeys[..]`.
+        let f_keypoint_left = |idx: usize| -> &KeyPoint {
+            if kf.camera2.is_some()
+                && let Some(n_left) = f.n_left
+                && idx >= n_left
+            {
+                &f.keys_right.as_ref().expect("keys_right")[idx - n_left]
+            } else {
+                &f.keys[idx]
+            }
+        };
+
+        // Frame keypoint for a *right* match: uses the Frame's second camera
+        // flag, matching `(!F.mpCamera2) ? F.mvKeys[..]`.
+        let f_keypoint_right = |idx: usize| -> &KeyPoint {
+            if f.camera2.is_some()
+                && let Some(n_left) = f.n_left
+                && idx >= n_left
+            {
+                &f.keys_right.as_ref().expect("keys_right")[idx - n_left]
+            } else {
+                &f.keys[idx]
+            }
+        };
+
+        // We perform the matching over ORB that belong to the same vocabulary node (at a certain level)
+        let mut kf_it = feat_vec_kf.0.iter().peekable();
+        let mut f_it = f.feat_vec.0.iter().peekable();
+
+        while let (Some(kf_entry), Some(f_entry)) = (kf_it.peek(), f_it.peek()) {
+            let (&kf_node, kf_indices) = *kf_entry;
+            let (&f_node, f_indices) = *f_entry;
+            match kf_node.cmp(&f_node) {
+                Ordering::Equal => {
+                    for &real_idx_kf in kf_indices {
+                        let real_idx_kf = real_idx_kf as usize;
+
+                        let Some(mp) = map_points_kf.get(real_idx_kf).and_then(|m| m.as_ref())
+                        else {
+                            continue;
+                        };
+                        if mp.is_bad() {
+                            continue;
+                        }
+
+                        let d_kf = kf
+                            .descriptors
+                            .row(real_idx_kf as i32)
+                            .expect("kf descriptor");
+
+                        // Best/second-best for the left image, and (stereo
+                        // fisheye) for the right image.
+                        let mut best_dist1 = 256;
+                        let mut best_idx_f: i32 = -1;
+                        let mut best_dist2 = 256;
+                        let mut best_dist1_r = 256;
+                        let mut best_idx_fr: i32 = -1;
+                        let mut best_dist2_r = 256;
+
+                        for &real_idx_f in f_indices {
+                            let real_idx_f = real_idx_f as usize;
+
+                            if mappoint_matches[real_idx_f].is_some() {
+                                continue;
+                            }
+
+                            let d_f = f.descriptors.row(real_idx_f as i32).expect("f descriptor");
+                            let dist = descriptor_distance(&d_kf, &d_f);
+
+                            match f.n_left {
+                                // Monocular frame.
+                                None => {
+                                    if dist < best_dist1 {
+                                        best_dist2 = best_dist1;
+                                        best_dist1 = dist;
+                                        best_idx_f = real_idx_f as i32;
+                                    } else if dist < best_dist2 {
+                                        best_dist2 = dist;
+                                    }
+                                }
+                                // Stereo fisheye: left indices track the left
+                                // best, right indices track the right best.
+                                Some(n_left) => {
+                                    if real_idx_f < n_left {
+                                        if dist < best_dist1 {
+                                            best_dist2 = best_dist1;
+                                            best_dist1 = dist;
+                                            best_idx_f = real_idx_f as i32;
+                                        } else if dist < best_dist2 {
+                                            best_dist2 = dist;
+                                        }
+                                    } else if dist < best_dist1_r {
+                                        best_dist2_r = best_dist1_r;
+                                        best_dist1_r = dist;
+                                        best_idx_fr = real_idx_f as i32;
+                                    } else if dist < best_dist2_r {
+                                        best_dist2_r = dist;
+                                    }
+                                }
+                            }
+                        }
+
+                        if best_dist1 <= TH_LOW {
+                            // Left match: standard Lowe ratio test.
+                            if (best_dist1 as f32) < self.nn_ratio * best_dist2 as f32 {
+                                let best_idx_f = best_idx_f as usize;
+                                mappoint_matches[best_idx_f] = Some(mp.clone());
+
+                                if self.check_orientation {
+                                    let mut rot = kf_keypoint(real_idx_kf).angle()
+                                        - f_keypoint_left(best_idx_f).angle();
+                                    if rot < 0.0 {
+                                        rot += 360.0;
+                                    }
+                                    let mut bin = (rot * factor).round() as usize;
+                                    if bin == HISTO_LENGTH {
+                                        bin = 0;
+                                    }
+                                    debug_assert!(bin < HISTO_LENGTH);
+                                    rot_hist[bin].push(best_idx_f);
+                                }
+                                n_matches += 1;
+                            }
+
+                            // Right match (stereo fisheye). C++ keeps this even
+                            // when the ratio test fails (`|| true`).
+                            if best_dist1_r <= TH_LOW {
+                                let best_idx_fr = best_idx_fr as usize;
+                                mappoint_matches[best_idx_fr] = Some(mp.clone());
+
+                                if self.check_orientation {
+                                    let mut rot = kf_keypoint(real_idx_kf).angle()
+                                        - f_keypoint_right(best_idx_fr).angle();
+                                    if rot < 0.0 {
+                                        rot += 360.0;
+                                    }
+                                    let mut bin = (rot * factor).round() as usize;
+                                    if bin == HISTO_LENGTH {
+                                        bin = 0;
+                                    }
+                                    debug_assert!(bin < HISTO_LENGTH);
+                                    rot_hist[bin].push(best_idx_fr);
+                                }
+                                n_matches += 1;
+                            }
+                        }
+                    }
+
+                    kf_it.next();
+                    f_it.next();
+                }
+                // KFit->first < Fit->first  =>  advance KF
+                Ordering::Less => {
+                    kf_it.next();
+                }
+                // else  =>  advance F
+                Ordering::Greater => {
+                    f_it.next();
+                }
+            }
+        }
+
+        // Apply rotation consistency: drop matches outside the three dominant
+        // orientation bins.
+        if self.check_orientation {
+            let maxima = compute_three_maxima(&rot_hist);
+            for i in 0..HISTO_LENGTH {
+                if Some(i) != maxima[0] && Some(i) != maxima[1] && Some(i) != maxima[2] {
+                    for j in 0..rot_hist[i].len() {
+                        mappoint_matches[rot_hist[i][j]] = None;
+                        n_matches -= 1;
+                    }
+                }
+            }
+        }
+
+        n_matches
+    }
+
+    // Search matches between MapPoints already associated to two KeyFrames,
+    // constrained to ORB that belong to the same vocabulary node.
+    // Used in Loop Detection.
+    fn search_by_bow_keyframe(
+        &self,
+        kf1: &KeyFrame,
+        kf2: &KeyFrame,
+        matches12: &mut Vec<Option<Arc<MapPoint>>>,
+    ) -> i32 {
+        let keys_un1 = &kf1.keys_un;
+        let keys_un2 = &kf2.keys_un;
+        let feat_vec1 = &kf1.feat_vec;
+        let feat_vec2 = &kf2.feat_vec;
+        let map_points1 = kf1.get_map_point_matches();
+        let map_points2 = kf2.get_map_point_matches();
+
+        // matches12[i] is the MapPoint in kf2 matched to kf1's keypoint i.
+        matches12.clear();
+        matches12.resize(map_points1.len(), None);
+        let mut matched2 = vec![false; map_points2.len()];
+
+        let mut rot_hist: [Vec<usize>; HISTO_LENGTH] =
+            std::array::from_fn(|_| Vec::with_capacity(500));
+        let factor = 1.0 / HISTO_LENGTH as f32;
+
+        let mut n_matches = 0;
+
+        let mut f1_it = feat_vec1.0.iter().peekable();
+        let mut f2_it = feat_vec2.0.iter().peekable();
+
+        while let (Some(entry1), Some(entry2)) = (f1_it.peek(), f2_it.peek()) {
+            let (&node1, indices1) = *entry1;
+            let (&node2, indices2) = *entry2;
+            match node1.cmp(&node2) {
+                Ordering::Equal => {
+                    for &idx1 in indices1 {
+                        let idx1 = idx1 as usize;
+                        // Skip right-camera indices (stereo fisheye).
+                        if kf1.n_left.is_some() && idx1 >= keys_un1.len() {
+                            continue;
+                        }
+
+                        let Some(mp1) = map_points1.get(idx1).and_then(|m| m.as_ref()) else {
+                            continue;
+                        };
+                        if mp1.is_bad() {
+                            continue;
+                        }
+
+                        let d1 = kf1.descriptors.row(idx1 as i32).expect("kf1 descriptor");
+
+                        let mut best_dist1 = 256;
+                        let mut best_idx2: i32 = -1;
+                        let mut best_dist2 = 256;
+
+                        for &idx2 in indices2 {
+                            let idx2 = idx2 as usize;
+                            // Skip right-camera indices (stereo fisheye).
+                            if kf2.n_left.is_some() && idx2 >= keys_un2.len() {
+                                continue;
+                            }
+
+                            let Some(mp2) = map_points2.get(idx2).and_then(|m| m.as_ref()) else {
+                                continue;
+                            };
+                            if matched2[idx2] || mp2.is_bad() {
+                                continue;
+                            }
+
+                            let d2 = kf2.descriptors.row(idx2 as i32).expect("kf2 descriptor");
+                            let dist = descriptor_distance(&d1, &d2);
+
+                            if dist < best_dist1 {
+                                best_dist2 = best_dist1;
+                                best_dist1 = dist;
+                                best_idx2 = idx2 as i32;
+                            } else if dist < best_dist2 {
+                                best_dist2 = dist;
+                            }
+                        }
+
+                        if best_dist1 < TH_LOW
+                            && (best_dist1 as f32) < self.nn_ratio * best_dist2 as f32
+                        {
+                            let best_idx2 = best_idx2 as usize;
+                            matches12[idx1] = map_points2[best_idx2].clone();
+                            matched2[best_idx2] = true;
+
+                            if self.check_orientation {
+                                let mut rot = keys_un1[idx1].angle() - keys_un2[best_idx2].angle();
+                                if rot < 0.0 {
+                                    rot += 360.0;
+                                }
+                                let mut bin = (rot * factor).round() as usize;
+                                if bin == HISTO_LENGTH {
+                                    bin = 0;
+                                }
+                                debug_assert!(bin < HISTO_LENGTH);
+                                rot_hist[bin].push(idx1);
+                            }
+                            n_matches += 1;
+                        }
+                    }
+
+                    f1_it.next();
+                    f2_it.next();
+                }
+                Ordering::Less => {
+                    f1_it.next();
+                }
+                Ordering::Greater => {
+                    f2_it.next();
+                }
+            }
+        }
+
+        if self.check_orientation {
+            let maxima = compute_three_maxima(&rot_hist);
+            for i in 0..HISTO_LENGTH {
+                if Some(i) != maxima[0] && Some(i) != maxima[1] && Some(i) != maxima[2] {
+                    for j in 0..rot_hist[i].len() {
+                        matches12[rot_hist[i][j]] = None;
+                        n_matches -= 1;
+                    }
+                }
             }
         }
 

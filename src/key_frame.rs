@@ -90,6 +90,8 @@ pub struct KeyFrame {
     // Keypoints, stereo coordinate and descriptors (all associated by an index)
     pub keys: Vec<KeyPoint>,
     pub keys_un: Vec<KeyPoint>,
+    // KeyPoints in the right image (for stereo fisheye, coordinates are needed).
+    pub keys_right: Option<Vec<KeyPoint>>,
     pub u_right: Vec<f32>, // negative value for monocular points
     pub depth: Vec<f32>,   // negative value for monocular points
     pub descriptors: Mat,
@@ -133,6 +135,10 @@ pub struct KeyFrame {
 
     pub camera: Arc<dyn GeometricCamera>,
     pub camera2: Option<Arc<dyn GeometricCamera>>,
+
+    // Number of KeyPoints in the left and right images (stereo fisheye).
+    pub n_left: Option<usize>,
+    pub n_right: Option<usize>,
 
     // TODO: others here
 

@@ -1,6 +1,5 @@
 use opencv::core::{KeyPoint, Point2f};
 use opencv::prelude::*;
-use std::i32;
 use std::sync::Arc;
 use std::{cmp::Ordering, collections::HashSet};
 
@@ -32,7 +31,7 @@ impl OrbMatcher {
     pub fn search_by_projection_keypoints_mappoints(
         &self,
         f: &mut Frame,
-        map_points: Vec<Arc<MapPoint>>,
+        map_points: &[Arc<MapPoint>],
         th: f32,            // default 3.0
         far_points: bool,   // default false
         th_far_points: f32, // default 50.0f
@@ -41,7 +40,7 @@ impl OrbMatcher {
         let factor = th != 1.0;
 
         for mp in map_points.iter() {
-            if mp.track_in_view && !mp.track_in_view_r {
+            if !mp.track_in_view && !mp.track_in_view_r {
                 continue;
             }
             if far_points && mp.track_depth > th_far_points {
@@ -128,24 +127,108 @@ impl OrbMatcher {
                             continue;
                         }
 
-                        // Also match with the stereo observation at right camera
-                        if let (Some(_n_left), Some(right_to_left_match), Some(best_idx)) =
-                            (&f.n_left, &f.right_to_left_match, best_idx)
-                        {
-                            if let Some(m) = right_to_left_match.get(best_idx) {
-                                if let Some(p) = f.map_points.get_mut(*m) {
-                                    *p = Some(mp.clone());
-                                    n_matches += 1;
-                                }
+                        // bestLevel != bestLevel2 || bestDist <= nnratio*bestDist2
+                        // (always holds here, since the inverse case `continue`d
+                        // above). Assign the MapPoint to the matched keypoint.
+                        let best_idx = best_idx.expect("best_idx set when best_dist <= TH_HIGH");
+                        f.map_points[best_idx] = Some(mp.clone());
+
+                        // Also match with the stereo observation at the right camera (stereo fisheye only).
+                        let right_partner = match (f.n_left, f.left_to_right_match.as_ref()) {
+                            (Some(n_left), Some(l2r)) if l2r[best_idx] != usize::MAX => {
+                                Some(l2r[best_idx] + n_left)
+                            }
+                            _ => None,
+                        };
+                        if let Some(right_idx) = right_partner {
+                            f.map_points[right_idx] = Some(mp.clone());
+                            n_matches += 1;
+                        }
+
+                        n_matches += 1;
+                    }
+                }
+            }
+
+            // Right-camera projection (stereo fisheye only).
+            if let Some(n_left) = f.n_left {
+                if mp.track_in_view_r {
+                    let predicted_level = mp.track_scale_level_r;
+                    if predicted_level == -1 {
+                        continue;
+                    }
+
+                    // The size of the window will depend on the viewing direction
+                    let r = radius_by_viewing_cos(mp.track_view_cos_r);
+
+                    let indices = f.get_features_in_area(
+                        mp.track_proj_xr,
+                        mp.track_proj_yr,
+                        r * f.scale_factors[predicted_level as usize],
+                        predicted_level - 1,
+                        predicted_level,
+                        true,
+                    );
+
+                    if indices.is_empty() {
+                        continue;
+                    }
+
+                    let mp_descriptor = mp.get_descriptor();
+
+                    let mut best_dist = 256;
+                    let mut best_level = None;
+                    let mut best_dist2 = 256;
+                    let mut best_level2 = None;
+                    let mut best_idx = None;
+
+                    // Get best and second matches with near keypoints
+                    for idx in indices.into_iter() {
+                        if let Some(Some(it)) = f.map_points.get(idx + n_left) {
+                            if it.observations() > 0 {
+                                continue;
                             }
                         }
 
-                        if let (Some(best_idx), Some(n_left)) = (best_idx, f.n_left) {
-                            if let Some(p) = f.map_points.get_mut(best_idx + n_left) {
-                                *p = Some(mp.clone());
-                                n_matches += 1;
-                            }
+                        let d = f.descriptors.row((idx + n_left) as i32).expect("get row");
+                        let dist = descriptor_distance(&mp_descriptor, &d);
+
+                        let octave = f.keys_right.as_ref().unwrap()[idx].octave();
+                        if dist < best_dist {
+                            best_dist2 = best_dist;
+                            best_dist = dist;
+                            best_level2 = best_level;
+                            best_level = Some(octave);
+                            best_idx = Some(idx);
+                        } else if dist < best_dist2 {
+                            best_level2 = Some(octave);
+                            best_dist2 = dist;
                         }
+                    }
+
+                    // Apply ratio to second match (only if best and second are in the same scale level)
+                    if best_dist <= TH_HIGH {
+                        if best_level == best_level2
+                            && best_dist as f32 > self.nn_ratio * best_dist2 as f32
+                        {
+                            continue;
+                        }
+
+                        let best_idx = best_idx.expect("best_idx set when best_dist <= TH_HIGH");
+
+                        // Also match with the stereo observation at the left
+                        // camera. `usize::MAX` is the "no match" sentinel.
+                        let left_partner = match f.right_to_left_match.as_ref() {
+                            Some(r2l) if r2l[best_idx] != usize::MAX => Some(r2l[best_idx]),
+                            _ => None,
+                        };
+                        if let Some(left_idx) = left_partner {
+                            f.map_points[left_idx] = Some(mp.clone());
+                            n_matches += 1;
+                        }
+
+                        f.map_points[best_idx + n_left] = Some(mp.clone());
+                        n_matches += 1;
                     }
                 }
             }
@@ -260,7 +343,7 @@ impl OrbMatcher {
                         }
                     }
 
-                    if best_dist < TH_HIGH {
+                    if best_dist <= TH_HIGH {
                         *current_frame.map_points.get_mut(best_idx2).unwrap() = Some(mp.clone());
                         n_matches += 1;
 
@@ -285,14 +368,14 @@ impl OrbMatcher {
                                     .unwrap()
                             };
                             let kp_cf = if let Some(n_left) = current_frame.n_left {
-                                if i < n_left {
-                                    current_frame.keys.get(i).unwrap()
+                                if best_idx2 < n_left {
+                                    current_frame.keys.get(best_idx2).unwrap()
                                 } else {
                                     current_frame
                                         .keys_right
                                         .as_ref()
                                         .expect("missing keys right")
-                                        .get(i - n_left)
+                                        .get(best_idx2 - n_left)
                                         .unwrap()
                                 }
                             } else {
@@ -367,7 +450,7 @@ impl OrbMatcher {
                                 best_idx2 = i2;
                             }
                         }
-                        if best_dist < TH_HIGH {
+                        if best_dist <= TH_HIGH {
                             *current_frame
                                 .map_points
                                 .get_mut(best_idx2 + n_left)
@@ -511,11 +594,11 @@ impl OrbMatcher {
                 let mut best_idx2 = 0;
 
                 for i2 in indices2 {
+                    // Skip keypoints that already have a MapPoint.
                     if current_frame
                         .map_points
                         .get(i2)
-                        .as_ref()
-                        .is_none_or(|inner| inner.is_none())
+                        .is_some_and(|inner| inner.is_some())
                     {
                         continue;
                     }
@@ -641,7 +724,7 @@ impl OrbMatcher {
                 continue;
             }
 
-            let predicted_level = mp.predict_scale_keyframe(dist, &kf);
+            let predicted_level = mp.predict_scale_keyframe(dist, kf);
 
             // Search in radius
             let radius = th * kf.scale_factors[predicted_level];
@@ -760,7 +843,7 @@ impl OrbMatcher {
                 continue;
             }
 
-            let predicted_level = mp.predict_scale_keyframe(dist, &kf);
+            let predicted_level = mp.predict_scale_keyframe(dist, kf);
 
             // Search in radius
             let radius = th * kf.scale_factors[predicted_level];
@@ -964,8 +1047,7 @@ impl OrbMatcher {
                                 n_matches += 1;
                             }
 
-                            // Right match (stereo fisheye). C++ keeps this even
-                            // when the ratio test fails (`|| true`).
+                            // Right match (stereo fisheye)
                             if best_dist1_r <= TH_LOW {
                                 let best_idx_fr = best_idx_fr as usize;
                                 mappoint_matches[best_idx_fr] = Some(mp.clone());
@@ -1244,7 +1326,7 @@ impl OrbMatcher {
                     for j in 0..rot_hist[i].len() {
                         let idx1 = rot_hist[i][j];
                         if matches12[idx1] >= 0 {
-                            matches12[idx1] = 1;
+                            matches12[idx1] = -1;
                             n_matches -= 1;
                         }
                     }
@@ -1937,10 +2019,10 @@ fn compute_three_maxima<T>(histo: &[Vec<T>]) -> [Option<usize>; 3] {
             top[2] = item;
         }
     }
-    let threshold = top[0].0 / 10;
+    let threshold = top[0].0 as f32 * 0.1;
     [
         top[0].1,
-        top[1].1.filter(|_| top[1].0 >= threshold),
-        top[2].1.filter(|_| top[2].0 >= threshold),
+        top[1].1.filter(|_| top[1].0 as f32 >= threshold),
+        top[2].1.filter(|_| top[2].0 as f32 >= threshold),
     ]
 }

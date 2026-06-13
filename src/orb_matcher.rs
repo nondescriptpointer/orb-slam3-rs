@@ -1,5 +1,6 @@
-use opencv::core::KeyPoint;
+use opencv::core::{KeyPoint, Point2f};
 use opencv::prelude::*;
+use std::i32;
 use std::sync::Arc;
 use std::{cmp::Ordering, collections::HashSet};
 
@@ -311,7 +312,7 @@ impl OrbMatcher {
                             if bin == HISTO_LENGTH {
                                 bin = 0;
                             }
-                            assert!(bin >= 0 && bin < HISTO_LENGTH);
+                            debug_assert!(bin < HISTO_LENGTH);
                             rot_hist[bin].push(best_idx2);
                         }
                     }
@@ -408,7 +409,7 @@ impl OrbMatcher {
                                 if bin == HISTO_LENGTH {
                                     bin = 0;
                                 }
-                                assert!(bin >= 0 && bin < HISTO_LENGTH);
+                                debug_assert!(bin < HISTO_LENGTH);
                                 rot_hist[bin].push(best_idx2 + n_left);
                             }
                         }
@@ -551,7 +552,7 @@ impl OrbMatcher {
                         if bin == HISTO_LENGTH {
                             bin = 0;
                         }
-                        assert!(bin >= 0 && bin < HISTO_LENGTH);
+                        debug_assert!(bin < HISTO_LENGTH);
                         rot_hist[bin].push(best_idx2);
                     }
                 }
@@ -672,7 +673,7 @@ impl OrbMatcher {
                 }
             }
 
-            if best_dist <= (TH_LOW as f32 * ratio_hamming) as i32 {
+            if best_dist as f32 <= (TH_LOW as f32 * ratio_hamming) {
                 matched[best_idx as usize] = Some(mp.clone());
                 n_matches += 1;
             }
@@ -791,7 +792,7 @@ impl OrbMatcher {
                 }
             }
 
-            if best_dist <= (TH_LOW as f32 * ratio_hamming) as i32 {
+            if best_dist as f32 <= (TH_LOW as f32 * ratio_hamming) {
                 matched[best_idx as usize] = Some(mp.clone());
                 matched_kf[best_idx as usize] = Some(kfi.clone());
                 n_matches += 1;
@@ -1147,6 +1148,118 @@ impl OrbMatcher {
         }
 
         n_matches
+    }
+
+    // Matching for the Map Initialization (only used in the monocular case)
+    fn search_for_initialization(
+        &self,
+        f1: &Frame,
+        f2: &Frame,
+        prev_matched: &mut [Point2f],
+        window_size: i32, // default 10
+    ) -> (Vec<i32>, i32) {
+        let mut n_matches = 0;
+
+        let mut matches12 = vec![-1; f1.keys_un.as_ref().unwrap().len()];
+
+        let mut rot_hist: [Vec<usize>; HISTO_LENGTH] =
+            std::array::from_fn(|_| Vec::with_capacity(500));
+        let factor = 1.0 / HISTO_LENGTH as f32;
+
+        let f2_keys_un_len = f2.keys_un.as_ref().unwrap().len();
+        let mut matched_distance = vec![i32::MAX; f2_keys_un_len];
+        let mut matches21: Vec<i32> = vec![-1; f2_keys_un_len];
+
+        for (i1, kp1) in f1.keys_un.as_ref().unwrap().iter().enumerate() {
+            let level1 = kp1.octave();
+            if level1 > 0 {
+                continue;
+            }
+
+            let indices2 = f2.get_features_in_area(
+                prev_matched[i1].x,
+                prev_matched[i1].y,
+                window_size as f32,
+                level1,
+                level1,
+                false,
+            );
+            if indices2.is_empty() {
+                continue;
+            }
+
+            let d1 = f1.descriptors.row(i1 as i32).unwrap();
+
+            let mut best_dist = i32::MAX;
+            let mut best_dist2 = i32::MAX;
+            let mut best_idx2 = -1;
+
+            for i2 in indices2 {
+                let d2 = f2.descriptors.row(i2 as i32).unwrap();
+                let dist = descriptor_distance(&d1, &d2);
+                if matched_distance[i2] <= dist {
+                    continue;
+                }
+                if dist < best_dist {
+                    best_dist2 = best_dist;
+                    best_dist = dist;
+                    best_idx2 = i2 as i32;
+                } else if dist < best_dist2 {
+                    best_dist2 = dist;
+                }
+            }
+
+            if best_dist <= TH_LOW {
+                if (best_dist as f32) < best_dist2 as f32 * self.nn_ratio {
+                    if matches21[best_idx2 as usize] >= 0 {
+                        matches12[matches21[best_idx2 as usize] as usize] = -1;
+                        n_matches -= 1;
+                    }
+                    matches12[i1] = best_idx2;
+                    matches21[best_idx2 as usize] = i1 as i32;
+                    matched_distance[best_idx2 as usize] = best_dist;
+                    n_matches += 1;
+
+                    if self.check_orientation {
+                        let mut rot = f1.keys_un.as_ref().unwrap()[i1].angle()
+                            - f2.keys_un.as_ref().unwrap()[best_idx2 as usize].angle();
+                        if rot < 0. {
+                            rot += 360.;
+                        }
+                        let mut bin = (rot * factor).round() as usize;
+                        if bin == HISTO_LENGTH {
+                            bin = 0;
+                        }
+                        debug_assert!(bin < HISTO_LENGTH);
+                        rot_hist[bin].push(i1);
+                    }
+                }
+            }
+        }
+
+        if self.check_orientation {
+            let maxima = compute_three_maxima(&rot_hist);
+            for i in 0..HISTO_LENGTH {
+                if Some(i) != maxima[0] && Some(i) != maxima[1] && Some(i) != maxima[2] {
+                    for j in 0..rot_hist[i].len() {
+                        let idx1 = rot_hist[i][j];
+                        if matches12[idx1] >= 0 {
+                            matches12[idx1] = 1;
+                            n_matches -= 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        //Update prev matched
+        for (i1, &i2) in matches12.iter().enumerate() {
+            if i2 >= 0 {
+                prev_matched[i1] = f2.keys_un.as_ref().unwrap()[i2 as usize].pt();
+            }
+        }
+
+        (matches12, n_matches)
     }
 }
 

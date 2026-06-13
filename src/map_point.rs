@@ -225,15 +225,28 @@ impl MapPoint {
 
     pub fn predict_scale(&self, current_dist: f32, f: &Frame) -> usize {
         let ratio = self.max_distance / current_dist;
-
         let mut scale = (ratio.ln() / f.log_scale_factor).ceil() as usize;
         if scale < 0 {
             scale = 0;
         } else if scale >= f.scale_levels {
             scale = f.scale_levels - 1;
         }
-
         scale
+    }
+
+    pub fn predict_scale_keyframe(&self, current_dist: f32, f: &KeyFrame) -> usize {
+        let ratio = self.max_distance / current_dist;
+        let mut scale = (ratio.ln() / f.log_scale_factor).ceil() as usize;
+        if scale < 0 {
+            scale = 0;
+        } else if scale >= f.scale_levels {
+            scale = f.scale_levels - 1;
+        }
+        scale
+    }
+
+    pub fn get_normal(&self) -> Vector3<f32> {
+        self.normal_vector
     }
 
     // TODO: HERE

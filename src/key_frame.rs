@@ -3,6 +3,7 @@ use opencv::core::{KeyPoint, Mat};
 use std::sync::{Arc, atomic::AtomicUsize};
 
 use crate::{
+    camera_models::GeometricCamera,
     imu_types::{Bias, Calib, Preintegrated},
     map_point::MapPoint,
     orb_vocabulary::{BowVector, FeatureVector},
@@ -101,7 +102,7 @@ pub struct KeyFrame {
     pub tcp: Isometry3<f32>,
 
     // Scale
-    pub scale_levels: u32,
+    pub scale_levels: usize,
     pub scale_factor: f32,
     pub log_scale_factor: f32,
     pub scale_factors: Vec<f32>,
@@ -129,6 +130,11 @@ pub struct KeyFrame {
 
     pub loop_cand_kfs: Vec<Arc<KeyFrame>>,
     pub merge_cand_kfs: Vec<Arc<KeyFrame>>,
+
+    pub camera: Arc<dyn GeometricCamera>,
+    pub camera2: Option<Arc<dyn GeometricCamera>>,
+
+    // TODO: others here
 
     // The following variables originally needed to be accessed through a mutex to be thread safe
     // TODO: figure out how to approach this
@@ -160,6 +166,16 @@ pub struct KeyFrame {
 impl KeyFrame {
     pub fn get_map_point_matches(&self) -> Vec<Option<Arc<MapPoint>>> {
         // TODO: signature might also change
+        Vec::new()
+    }
+
+    pub fn is_in_image(&self, x: f32, y: f32) -> bool {
+        // TODO
+        true
+    }
+
+    pub fn get_features_in_area(&self, x: f32, y: f32, r: f32, right: bool) -> Vec<usize> {
+        // TODO
         Vec::new()
     }
 }

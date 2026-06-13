@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::frame::Frame;
 use crate::key_frame::KeyFrame;
 use crate::map_point::MapPoint;
-use nalgebra::Point3;
+use nalgebra::{Isometry3, Point3, Similarity3, Translation3};
 
 const TH_HIGH: i32 = 100;
 const TH_LOW: i32 = 50;
@@ -569,6 +569,239 @@ impl OrbMatcher {
                         n_matches -= 1;
                     }
                 }
+            }
+        }
+
+        n_matches
+    }
+
+    // Project MapPoints using a Similarity Transformation and search matches.
+    // Used in loop detection (Loop Closing)
+    pub fn search_by_projection_similarity_loop_detection(
+        &self,
+        kf: &KeyFrame,
+        scw: &Similarity3<f32>,
+        points: &[Arc<MapPoint>],
+        matched: &mut [Option<Arc<MapPoint>>],
+        th: f32,
+        ratio_hamming: f32, // default 1.0
+    ) -> i32 {
+        let mut n_matches = 0;
+
+        // Get calibration parameters for later projection
+        let fx = kf.fx;
+        let fy = kf.fy;
+        let cx = kf.cx;
+        let cy = kf.cy;
+
+        let t_cw = Isometry3::from_parts(
+            Translation3::from(scw.isometry.translation.vector / scw.scaling()),
+            scw.isometry.rotation,
+        );
+        let t_wc = t_cw.inverse();
+        let ow = t_wc.translation.vector;
+
+        // Set of MapPoints already found in the KeyFrame
+        let already_found: HashSet<_> =
+            matched.iter().filter_map(|m| m.as_ref().cloned()).collect();
+
+        // For each Candidate MapPoint Project and Match
+        for mp in points {
+            // Discard bad MapPoints and already found
+            if mp.is_bad() || already_found.contains(mp) {
+                continue;
+            }
+
+            // Get 3D Coords.
+            let p3dw = mp.get_world_pos();
+
+            // Transform into Camera Coords
+            let p3dc = t_cw * p3dw;
+
+            // Depth must be positive
+            if p3dc[2] < 0. {
+                continue;
+            }
+
+            // Project into Image
+            let uv = kf.camera.project_n(&Point3::from(p3dc));
+
+            // Point must be inside the image
+            if !kf.is_in_image(uv[0], uv[1]) {
+                continue;
+            }
+
+            // Depth must be inside the scale invariance region of the point
+            let max_distance = mp.get_max_distance_invariance();
+            let min_distance = mp.get_min_distance_invariance();
+            let po = p3dw - ow;
+            let dist = po.norm();
+
+            if dist < min_distance || dist > max_distance {
+                continue;
+            }
+
+            // Viewing angle must be less than 60 deg
+            let pn = mp.get_normal();
+            if po.dot(&pn) < 0.5 * dist {
+                continue;
+            }
+
+            let predicted_level = mp.predict_scale_keyframe(dist, &kf);
+
+            // Search in radius
+            let radius = th * kf.scale_factors[predicted_level];
+
+            let indices = kf.get_features_in_area(uv[0], uv[1], radius, false);
+            if indices.is_empty() {
+                continue;
+            }
+
+            // Match to the most similar keypoint in the radius
+            let d_mp = mp.get_descriptor();
+
+            let mut best_dist = 256;
+            let mut best_idx = 0;
+
+            for idx in indices {
+                if matched[idx].is_some() {
+                    continue;
+                }
+                let kp_level = kf.keys_un[idx].octave() as usize;
+                if kp_level < predicted_level - 1 || kp_level > predicted_level {
+                    continue;
+                }
+                let d_kf = kf.descriptors.row(idx as i32).unwrap();
+                let dist = descriptor_distance(&d_mp, &d_kf);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_idx = idx;
+                }
+            }
+
+            if best_dist <= (TH_LOW as f32 * ratio_hamming) as i32 {
+                matched[best_idx] = Some(mp.clone());
+                n_matches += 1;
+            }
+        }
+
+        n_matches
+    }
+
+    // Project MapPoints using a Similarity Transformation and search matches.
+    // Used in Place Recognition (Loop Closing and Merging)
+    pub fn search_by_projection_similarity_loop_closing_merging(
+        &self,
+        kf: &KeyFrame,
+        scw: &Similarity3<f32>,
+        points: &[Arc<MapPoint>],
+        points_kf: &[Arc<KeyFrame>],
+        matched: &mut [Option<Arc<MapPoint>>],
+        matched_kf: &mut [Option<Arc<KeyFrame>>],
+        th: f32,
+        ratio_hamming: f32, // default 1.0
+    ) -> i32 {
+        let mut n_matches = 0;
+
+        // Get calibration parameters for later projection
+        let fx = kf.fx;
+        let fy = kf.fy;
+        let cx = kf.cx;
+        let cy = kf.cy;
+
+        let t_cw = Isometry3::from_parts(
+            Translation3::from(scw.isometry.translation.vector / scw.scaling()),
+            scw.isometry.rotation,
+        );
+        let t_wc = t_cw.inverse();
+        let ow = t_wc.translation.vector;
+
+        // Set of MapPoints already found in the KeyFrame
+        let already_found: HashSet<_> =
+            matched.iter().filter_map(|m| m.as_ref().cloned()).collect();
+
+        // For each Candidate MapPoint Project and Match
+        for (mp, kfi) in points.iter().zip(points_kf.iter()) {
+            // Discard bad MapPoints and already found
+            if mp.is_bad() || already_found.contains(mp) {
+                continue;
+            }
+
+            // Get 3D Coords.
+            let p3dw = mp.get_world_pos();
+
+            // Transform into Camera Coords
+            let p3dc = t_cw * p3dw;
+
+            // Depth must be positive
+            if p3dc[2] < 0. {
+                continue;
+            }
+
+            // Project into Image
+            let invz = 1. / p3dc[2];
+            let x = p3dc[0] * invz;
+            let y = p3dc[1] * invz;
+            let u = fx * x + cx;
+            let v = fy * y + cy;
+
+            // Point must be inside the image
+            if !kf.is_in_image(u, v) {
+                continue;
+            }
+
+            // Depth must be inside the scale invariance region of the point
+            let max_distance = mp.get_max_distance_invariance();
+            let min_distance = mp.get_min_distance_invariance();
+            let po = p3dw - ow;
+            let dist = po.norm();
+
+            if dist < min_distance || dist > max_distance {
+                continue;
+            }
+
+            // Viewing angle must be less than 60 deg
+            let pn = mp.get_normal();
+            if po.dot(&pn) < 0.5 * dist {
+                continue;
+            }
+
+            let predicted_level = mp.predict_scale_keyframe(dist, &kf);
+
+            // Search in radius
+            let radius = th * kf.scale_factors[predicted_level];
+
+            let indices = kf.get_features_in_area(u, v, radius, false);
+            if indices.is_empty() {
+                continue;
+            }
+
+            // Match to the most similar keypoint in the radius
+            let d_mp = mp.get_descriptor();
+
+            let mut best_dist = 256;
+            let mut best_idx = 0;
+
+            for idx in indices {
+                if matched[idx].is_some() {
+                    continue;
+                }
+                let kp_level = kf.keys_un[idx].octave() as usize;
+                if kp_level < predicted_level - 1 || kp_level > predicted_level {
+                    continue;
+                }
+                let d_kf = kf.descriptors.row(idx as i32).unwrap();
+                let dist = descriptor_distance(&d_mp, &d_kf);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_idx = idx;
+                }
+            }
+
+            if best_dist <= (TH_LOW as f32 * ratio_hamming) as i32 {
+                matched[best_idx] = Some(mp.clone());
+                matched_kf[best_idx] = Some(kfi.clone());
+                n_matches += 1;
             }
         }
 

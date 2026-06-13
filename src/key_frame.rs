@@ -184,4 +184,20 @@ impl KeyFrame {
         // TODO
         Vec::new()
     }
+
+    pub fn get_pose(&self) -> &Isometry3<f32> {
+        &self.tcw
+    }
+    pub fn get_pose_inverse(&self) -> &Isometry3<f32> {
+        &self.twc
+    }
+    pub fn get_camera_center(&self) -> &Vector3<f32> {
+        &self.twc.translation.vector
+    }
+    pub fn get_right_pose(&self) -> Isometry3<f32> {
+        self.trl * self.tcw
+    }
+    pub fn get_right_pose_inverse(&self) -> Isometry3<f32> {
+        self.twc * self.tlr
+    }
 }

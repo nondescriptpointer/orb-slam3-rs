@@ -7,7 +7,7 @@ use std::{cmp::Ordering, collections::HashSet};
 use crate::frame::Frame;
 use crate::key_frame::KeyFrame;
 use crate::map_point::MapPoint;
-use nalgebra::{Isometry3, Point3, Similarity3, Translation3};
+use nalgebra::{Isometry3, Matrix3, Point3, Similarity3, Translation3};
 
 const TH_HIGH: i32 = 100;
 const TH_LOW: i32 = 50;
@@ -1261,6 +1261,242 @@ impl OrbMatcher {
 
         (matches12, n_matches)
     }
+
+    // Matching to triangulate new MapPoints. Check Epipolar Constraint.
+    fn search_for_triangulation(
+        &self,
+        kf1: &KeyFrame,
+        kf2: &KeyFrame,
+        matched_pairs: &mut Vec<(usize, usize)>,
+        only_stereo: bool,
+        coarse: bool,
+    ) -> i32 {
+        let feat_vec1 = &kf1.feat_vec;
+        let feat_vec2 = &kf2.feat_vec;
+
+        // Compute epipole in the second image
+        let t1w = kf1.get_pose();
+        let t2w = kf2.get_pose();
+        let tw2 = kf2.get_pose_inverse(); // for convenience
+        let cw = kf1.get_camera_center();
+        let c2 = t2w * Point3::from(*cw);
+        let ep = kf2.camera.project_n(&c2);
+
+        // Decompose an isometry into (R, t)
+        let decompose = |iso: &Isometry3<f32>| -> (Matrix3<f32>, Point3<f32>) {
+            (
+                iso.rotation.to_rotation_matrix().into_inner(),
+                Point3::from(iso.translation.vector),
+            )
+        };
+
+        // Relative pose(s) between the keyframes. The standard (pinhole /
+        // rectified-stereo) case uses a single T12; stereo-fisheye needs the
+        // four left/right camera combinations (ll, lr, rl, rr).
+        let mut r12 = Matrix3::<f32>::identity();
+        let mut t12 = Point3::<f32>::origin();
+        let mut rll = Matrix3::<f32>::identity();
+        let mut tll = Point3::<f32>::origin();
+        let mut rlr = Matrix3::<f32>::identity();
+        let mut tlr = Point3::<f32>::origin();
+        let mut rrl = Matrix3::<f32>::identity();
+        let mut trl = Point3::<f32>::origin();
+        let mut rrr = Matrix3::<f32>::identity();
+        let mut trr = Point3::<f32>::origin();
+
+        if kf1.camera2.is_none() && kf2.camera2.is_none() {
+            (r12, t12) = decompose(&(t1w * tw2));
+        } else {
+            let tr1w = kf1.get_right_pose();
+            let twr2 = kf2.get_right_pose_inverse();
+            (rll, tll) = decompose(&(t1w * tw2));
+            (rlr, tlr) = decompose(&(t1w * twr2));
+            (rrl, trl) = decompose(&(tr1w * tw2));
+            (rrr, trr) = decompose(&(tr1w * twr2));
+        }
+
+        // Matching speed-up by ORB Vocabulary
+        // Compare only ORB that share the same node
+        let map_points1 = kf1.get_map_point_matches();
+        let map_points2 = kf2.get_map_point_matches();
+
+        let mut n_matches = 0;
+        let mut matches12 = vec![-1i32; kf1.n as usize];
+
+        let mut rot_hist: [Vec<usize>; HISTO_LENGTH] =
+            std::array::from_fn(|_| Vec::with_capacity(500));
+        let factor = 1.0 / HISTO_LENGTH as f32;
+
+        let mut f1_it = feat_vec1.0.iter().peekable();
+        let mut f2_it = feat_vec2.0.iter().peekable();
+
+        while let (Some(entry1), Some(entry2)) = (f1_it.peek(), f2_it.peek()) {
+            let (&node1, indices1) = *entry1;
+            let (&node2, indices2) = *entry2;
+            match node1.cmp(&node2) {
+                Ordering::Equal => {
+                    for &idx1 in indices1 {
+                        let idx1 = idx1 as usize;
+
+                        // Skip if this keypoint already has a MapPoint.
+                        if map_points1[idx1].is_some() {
+                            continue;
+                        }
+
+                        let stereo1 = kf1.camera2.is_none() && kf1.u_right[idx1] >= 0.0;
+                        if only_stereo && !stereo1 {
+                            continue;
+                        }
+
+                        let kp1 = select_keypoint(kf1, idx1);
+                        let right1 = is_right(kf1, idx1);
+                        let d1 = kf1.descriptors.row(idx1 as i32).expect("kf1 descriptor");
+
+                        let mut best_dist = TH_LOW;
+                        let mut best_idx2: i32 = -1;
+
+                        for &idx2 in indices2 {
+                            let idx2 = idx2 as usize;
+
+                            // Skip if already matched (via a MapPoint).
+                            if map_points2[idx2].is_some() {
+                                continue;
+                            }
+
+                            let stereo2 = kf2.camera2.is_none() && kf2.u_right[idx2] >= 0.0;
+                            if only_stereo && !stereo2 {
+                                continue;
+                            }
+
+                            let d2 = kf2.descriptors.row(idx2 as i32).expect("kf2 descriptor");
+                            let dist = descriptor_distance(&d1, &d2);
+                            if dist > TH_LOW || dist > best_dist {
+                                continue;
+                            }
+
+                            let kp2 = select_keypoint(kf2, idx2);
+                            let right2 = is_right(kf2, idx2);
+
+                            // For non-stereo, non-fisheye matches discard
+                            // candidates too close to the epipole.
+                            if !stereo1 && !stereo2 && kf1.camera2.is_none() {
+                                let distex = ep.x - kp2.pt().x;
+                                let distey = ep.y - kp2.pt().y;
+                                if distex * distex + distey * distey
+                                    < 100.0 * kf2.scale_factors[kp2.octave() as usize]
+                                {
+                                    continue;
+                                }
+                            }
+
+                            // Pick the relative pose / cameras for this pair.
+                            let (r12_sel, t12_sel, cam1, cam2) =
+                                if kf1.camera2.is_some() && kf2.camera2.is_some() {
+                                    match (right1, right2) {
+                                        (true, true) => (
+                                            rrr,
+                                            trr,
+                                            kf1.camera2.as_ref().unwrap(),
+                                            kf2.camera2.as_ref().unwrap(),
+                                        ),
+                                        (true, false) => {
+                                            (rrl, trl, kf1.camera2.as_ref().unwrap(), &kf2.camera)
+                                        }
+                                        (false, true) => {
+                                            (rlr, tlr, &kf1.camera, kf2.camera2.as_ref().unwrap())
+                                        }
+                                        (false, false) => (rll, tll, &kf1.camera, &kf2.camera),
+                                    }
+                                } else {
+                                    (r12, t12, &kf1.camera, &kf2.camera)
+                                };
+
+                            if coarse
+                                || cam1.epipolar_constrain(
+                                    cam2.as_ref(),
+                                    kp1,
+                                    kp2,
+                                    &r12_sel,
+                                    &t12_sel,
+                                    kf1.level_sigma2[kp1.octave() as usize],
+                                    kf2.level_sigma2[kp2.octave() as usize],
+                                )
+                            {
+                                best_idx2 = idx2 as i32;
+                                best_dist = dist;
+                            }
+                        }
+
+                        if best_idx2 >= 0 {
+                            let best_idx2 = best_idx2 as usize;
+                            let kp2 = select_keypoint(kf2, best_idx2);
+                            matches12[idx1] = best_idx2 as i32;
+                            n_matches += 1;
+
+                            if self.check_orientation {
+                                let mut rot = kp1.angle() - kp2.angle();
+                                if rot < 0.0 {
+                                    rot += 360.0;
+                                }
+                                let mut bin = (rot * factor).round() as usize;
+                                if bin == HISTO_LENGTH {
+                                    bin = 0;
+                                }
+                                debug_assert!(bin < HISTO_LENGTH);
+                                rot_hist[bin].push(idx1);
+                            }
+                        }
+                    }
+
+                    f1_it.next();
+                    f2_it.next();
+                }
+                Ordering::Less => {
+                    f1_it.next();
+                }
+                Ordering::Greater => {
+                    f2_it.next();
+                }
+            }
+        }
+
+        if self.check_orientation {
+            let maxima = compute_three_maxima(&rot_hist);
+            for i in 0..HISTO_LENGTH {
+                if Some(i) != maxima[0] && Some(i) != maxima[1] && Some(i) != maxima[2] {
+                    for &idx1 in &rot_hist[i] {
+                        matches12[idx1] = -1;
+                        n_matches -= 1;
+                    }
+                }
+            }
+        }
+
+        matched_pairs.clear();
+        matched_pairs.reserve(n_matches as usize);
+        for (i, &m) in matches12.iter().enumerate() {
+            if m >= 0 {
+                matched_pairs.push((i, m as usize));
+            }
+        }
+
+        n_matches
+    }
+}
+
+// Selects the keypoint for `idx`, picking between the undistorted / left /
+// right keypoint vectors depending on the stereo-fisheye configuration.
+fn select_keypoint(kf: &KeyFrame, idx: usize) -> &KeyPoint {
+    match kf.n_left {
+        None => &kf.keys_un[idx],
+        Some(n_left) if idx < n_left => &kf.keys[idx],
+        Some(n_left) => &kf.keys_right.as_ref().expect("keys_right")[idx - n_left],
+    }
+}
+
+// Whether `idx` refers to a right-image keypoint (stereo fisheye only).
+fn is_right(kf: &KeyFrame, idx: usize) -> bool {
+    matches!(kf.n_left, Some(n_left) if idx >= n_left)
 }
 
 // Computes the Hamming distance between two ORB descriptors

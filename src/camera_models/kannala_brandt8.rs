@@ -6,19 +6,26 @@ use opencv::{
         Point3f, TermCriteria, TermCriteria_Type, Vector,
     },
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     camera_models::{GeometricCamera, Type, next_geometric_camera_id},
     two_view_reconstruction::{ReconstructResult, TwoViewReconstruction},
 };
-#[derive(Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KannalaBrandt8 {
     parameters: Vec<f32>,
     id: u64,
     camera_type: Type,
+    #[serde(skip)]
     tvr: Option<TwoViewReconstruction>,
     precision: f32,
+    #[serde(default = "default_lapping_area")]
     pub lapping_area: Vec<usize>,
+}
+
+fn default_lapping_area() -> Vec<usize> {
+    vec![0, 0]
 }
 
 struct TriangulateMatchesResult {

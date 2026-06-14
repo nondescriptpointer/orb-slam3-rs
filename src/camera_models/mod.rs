@@ -3,13 +3,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use nalgebra::{Isometry3, Matrix2x1, Matrix2x3, Matrix3, Point2, Point3, Vector3};
 use opencv::core::{KeyPoint, Mat, Point2f, Point3f};
+use serde::{Deserialize, Serialize};
 
 use crate::two_view_reconstruction::ReconstructResult;
 
 pub mod kannala_brandt8;
 pub mod pinhole;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Type {
     Pinhole,
     Fisheye,
@@ -98,5 +99,36 @@ impl std::fmt::Debug for dyn GeometricCamera {
             self.get_id(),
             self.get_type(),
         )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data")]
+pub enum GeometricCameraSerde {
+    Pinhole(pinhole::Pinhole),
+    KannalaBrandt8(kannala_brandt8::KannalaBrandt8),
+}
+impl GeometricCameraSerde {
+    pub fn into_boxed(self) -> Box<dyn GeometricCamera> {
+        match self {
+            GeometricCameraSerde::Pinhole(cam) => Box::new(cam),
+            GeometricCameraSerde::KannalaBrandt8(cam) => Box::new(cam),
+        }
+    }
+}
+
+impl TryFrom<&dyn GeometricCamera> for GeometricCameraSerde {
+    type Error = &'static str;
+    fn try_from(camera: &dyn GeometricCamera) -> Result<Self, Self::Error> {
+        if let Some(cam) = camera.as_any().downcast_ref::<pinhole::Pinhole>() {
+            return Ok(GeometricCameraSerde::Pinhole(cam.clone()));
+        }
+        if let Some(cam) = camera
+            .as_any()
+            .downcast_ref::<kannala_brandt8::KannalaBrandt8>()
+        {
+            return Ok(GeometricCameraSerde::KannalaBrandt8(cam.clone()));
+        }
+        Err("unknown GeometricCamera implementation")
     }
 }

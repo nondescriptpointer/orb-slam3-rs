@@ -9,7 +9,7 @@ use rand::seq::index;
 
 use crate::geometric_tools::triangulate;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct TwoViewReconstruction {
     // Keypoints reference frame (1)
     keys1: Vec<KeyPoint>,

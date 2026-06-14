@@ -2004,7 +2004,10 @@ pub(crate) fn descriptor_distance(a: &impl MatTraitConst, b: &impl MatTraitConst
 }
 
 fn radius_by_viewing_cos(view_cos: f32) -> f32 {
-    if view_cos > 0.998 { 2.5 } else { 4.0 }
+    // Compare in f64 to match C++ exactly: there `viewCos` (a `float`) is
+    // promoted to `double` for the comparison against the `0.998` double
+    // literal, so e.g. `0.998f` (= 0.998000025…) compares as `> 0.998`.
+    if view_cos as f64 > 0.998 { 2.5 } else { 4.0 }
 }
 
 fn compute_three_maxima<T>(histo: &[Vec<T>]) -> [Option<usize>; 3] {
@@ -2025,4 +2028,116 @@ fn compute_three_maxima<T>(histo: &[Vec<T>]) -> [Option<usize>; 3] {
         top[1].1.filter(|_| top[1].0 as f32 >= threshold),
         top[2].1.filter(|_| top[2].0 as f32 >= threshold),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::excessive_precision)]
+    use opencv::core::{CV_8U, MatTrait, Scalar};
+
+    use super::*;
+    use crate::test_helpers::*;
+
+    /// A 1x32 CV_8U descriptor with `bytes[i] = val` for the listed indices.
+    fn desc(nonzero: &[i32], val: u8) -> opencv::core::Mat {
+        let mut d =
+            opencv::core::Mat::new_rows_cols_with_default(1, 32, CV_8U, Scalar::all(0.0)).unwrap();
+        for &i in nonzero {
+            *d.at_2d_mut::<u8>(0, i).unwrap() = val;
+        }
+        d
+    }
+
+    #[test]
+    fn descriptor_distance_hamming() {
+        let zero = desc(&[], 0);
+        let ones = desc(&(0..32).collect::<Vec<_>>(), 0xFF);
+
+        assert_eq!(descriptor_distance(&zero, &zero), 0);
+        assert_eq!(descriptor_distance(&zero, &ones), 256);
+        assert_eq!(descriptor_distance(&ones, &ones), 0);
+
+        // One byte 0xFF -> 8 bits.
+        assert_eq!(descriptor_distance(&zero, &desc(&[0], 0xFF)), 8);
+        // 32 bytes of 0x01 -> 32 bits.
+        assert_eq!(
+            descriptor_distance(&zero, &desc(&(0..32).collect::<Vec<_>>(), 0x01)),
+            32
+        );
+        // 0xB2 (10110010) -> 4 bits.
+        assert_eq!(descriptor_distance(&zero, &desc(&[0], 0xB2)), 4);
+        // 0xB2 ^ 0x46 = 0xF4 (11110100) -> 5 bits.
+        assert_eq!(descriptor_distance(&desc(&[0], 0xB2), &desc(&[0], 0x46)), 5);
+    }
+
+    #[test]
+    fn radius_by_viewing_cos_boundaries() {
+        assert_eq!(radius_by_viewing_cos(1.0), 2.5);
+        assert_eq!(radius_by_viewing_cos(0.999), 2.5);
+        assert_eq!(radius_by_viewing_cos(0.998), 2.5);
+        assert_eq!(radius_by_viewing_cos(0.99), 4.0);
+        assert_eq!(radius_by_viewing_cos(0.5), 4.0);
+    }
+
+    #[test]
+    fn compute_three_maxima_cases() {
+        let mut h: Vec<Vec<u8>> = vec![Vec::new(); HISTO_LENGTH];
+
+        // Clear top three: bin0=10, bin1=5, bin2=8.
+        h[0] = vec![0; 10];
+        h[1] = vec![0; 5];
+        h[2] = vec![0; 8];
+        assert_eq!(compute_three_maxima(&h), [Some(0), Some(2), Some(1)]);
+
+        // Second below the 10% threshold -> 2nd and 3rd nullified.
+        let mut h2: Vec<Vec<u8>> = vec![Vec::new(); HISTO_LENGTH];
+        h2[4] = vec![0; 100];
+        h2[7] = vec![0; 5];
+        h2[9] = vec![0; 3];
+        assert_eq!(compute_three_maxima(&h2), [Some(4), None, None]);
+
+        // Third below threshold -> only 3rd nullified.
+        let mut h3: Vec<Vec<u8>> = vec![Vec::new(); HISTO_LENGTH];
+        h3[4] = vec![0; 100];
+        h3[7] = vec![0; 50];
+        h3[9] = vec![0; 3];
+        assert_eq!(compute_three_maxima(&h3), [Some(4), Some(7), None]);
+    }
+
+    #[test]
+    fn constants() {
+        assert_eq!(TH_LOW, 50);
+        assert_eq!(TH_HIGH, 100);
+        assert_eq!(HISTO_LENGTH, 30);
+    }
+
+    #[test]
+    fn search_for_initialization_self_matches() {
+        // Two frames from the same (non-repetitive) image -> identical
+        // extraction, so every matched octave-0 keypoint matches itself.
+        let f1 = build_frame_from(&make_noise_image());
+        let f2 = build_frame_from(&make_noise_image());
+        assert!(f1.n > 0);
+
+        let mut prev: Vec<Point2f> = f1
+            .keys_un
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|k| k.pt())
+            .collect();
+
+        let matcher = OrbMatcher::default();
+        let (matches12, n) = matcher.search_for_initialization(&f1, &f2, &mut prev, 10);
+
+        assert!(n > 0, "expected some matches");
+        let mut self_matches = 0;
+        for (i, &m) in matches12.iter().enumerate() {
+            if m >= 0 {
+                assert_eq!(m as usize, i, "match must be a self-match");
+                self_matches += 1;
+            }
+        }
+        assert_eq!(self_matches, n);
+    }
 }

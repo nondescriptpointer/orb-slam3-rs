@@ -106,9 +106,23 @@ pub(crate) fn make_calib() -> Calib {
     Calib::from_params(tbc, 1.0, 1.0, 1.0, 1.0)
 }
 
-pub(crate) fn build_frame() -> Frame {
+/// Deterministic pseudo-random texture: distinct ORB descriptors (a
+/// checkerboard is too repetitive and fails ratio tests on self-matches).
+pub(crate) fn make_noise_image() -> Mat {
+    let mut img = Mat::new_rows_cols_with_default(IMG_H, IMG_W, CV_8UC1, Scalar::all(0.0)).unwrap();
+    for y in 0..IMG_H {
+        for x in 0..IMG_W {
+            let idx = (y * IMG_W + x) as u32;
+            let v = idx.wrapping_mul(1103515245).wrapping_add(12345) >> 16;
+            *img.at_2d_mut::<u8>(y, x).unwrap() = (v & 0xFF) as u8;
+        }
+    }
+    img
+}
+
+pub(crate) fn build_frame_from(img: &Mat) -> Frame {
     Frame::from_monocular(
-        &make_image(),
+        img,
         0.0,
         extractor(),
         dummy_voc(),
@@ -119,6 +133,10 @@ pub(crate) fn build_frame() -> Frame {
         None,
         make_calib(),
     )
+}
+
+pub(crate) fn build_frame() -> Frame {
+    build_frame_from(&make_image())
 }
 
 pub(crate) fn keypoint(x: f32, y: f32) -> KeyPoint {

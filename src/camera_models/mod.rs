@@ -4,13 +4,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use nalgebra::{Isometry3, Matrix2x1, Matrix2x3, Matrix3, Point2, Point3, Vector3};
 use opencv::core::{KeyPoint, Mat, Point2f, Point3f};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::two_view_reconstruction::ReconstructResult;
 
 pub mod kannala_brandt8;
 pub mod pinhole;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Type {
     Pinhole,
     Fisheye,
@@ -87,6 +88,8 @@ pub trait GeometricCamera: Send + Sync {
 
     fn get_id(&self) -> u64;
     fn get_type(&self) -> Type;
+
+    fn is_equal(&self, other: &Arc<dyn GeometricCamera>) -> bool;
 }
 
 impl std::fmt::Debug for dyn GeometricCamera {

@@ -4,6 +4,7 @@ use crate::two_view_reconstruction::{ReconstructResult, TwoViewReconstruction};
 use nalgebra::{Matrix2x3, Matrix3, Point2, Point3, Vector3};
 use opencv::core::{KeyPointTraitConst, Mat, Point2f, Point3f};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pinhole {
@@ -199,19 +200,8 @@ impl GeometricCamera for Pinhole {
     fn get_type(&self) -> Type {
         self.camera_type
     }
-}
 
-impl Pinhole {
-    fn from_pinhole(other: &Self) -> Self {
-        Pinhole {
-            parameters: other.parameters.clone(),
-            id: next_geometric_camera_id(),
-            camera_type: Type::Pinhole,
-            tvr: None,
-        }
-    }
-
-    fn is_equal(&self, other: &dyn GeometricCamera) -> bool {
+    fn is_equal(&self, other: &Arc<dyn GeometricCamera>) -> bool {
         let Some(other) = other.as_any().downcast_ref::<Pinhole>() else {
             return false;
         };
@@ -226,6 +216,17 @@ impl Pinhole {
             }
         }
         is_same
+    }
+}
+
+impl Pinhole {
+    fn from_pinhole(other: &Self) -> Self {
+        Pinhole {
+            parameters: other.parameters.clone(),
+            id: next_geometric_camera_id(),
+            camera_type: Type::Pinhole,
+            tvr: None,
+        }
     }
 }
 

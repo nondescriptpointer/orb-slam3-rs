@@ -19,6 +19,7 @@ pub mod system;
 #[cfg(test)]
 mod test_helpers;
 pub mod two_view_reconstruction;
+pub mod viewer;
 
 /// Asserts that an aggregate is safe to send and share across threads even
 /// though it stores OpenCV FFI handles (`cv::Mat`, `cv::KeyPoint`). Those types

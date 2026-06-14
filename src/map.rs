@@ -23,14 +23,18 @@
 //! discipline as [`crate::map_point`]: snapshot the membership under the lock,
 //! release it, then call into the keyframes / map points.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use nalgebra::Isometry3;
 
+use crate::camera_models::GeometricCamera;
 use crate::key_frame::KeyFrame;
+use crate::key_frame_database::{self, KeyFrameDatabase};
 use crate::map_point::MapPoint;
+use crate::orb_vocabulary::OrbVocabulary;
 
 static NEXT_MAP_ID: AtomicU32 = AtomicU32::new(0);
 
@@ -59,10 +63,10 @@ struct MapInner {
     max_kf_id: u64,
 
     /// Index bumped on every big change (loop closure / global BA)
-    big_change_idx: i32,
+    big_change_idx: u32,
     /// Local map-change counter and the last value notified to the viewer
-    map_change: i32,
-    map_change_notified: i32,
+    map_change: u32,
+    map_change_notified: u32,
 
     imu_initialized: bool,
     is_inertial: bool,
@@ -89,6 +93,18 @@ pub struct Map {
     /// Serialises map-point creation so two threads cannot mint the same id
     pub point_creation: Mutex<()>,
 }
+
+impl Hash for Map {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.get_id().hash(state);
+    }
+}
+impl PartialEq for Map {
+    fn eq(&self, other: &Self) -> bool {
+        self.get_id() == other.get_id()
+    }
+}
+impl Eq for Map {}
 
 impl Default for Map {
     fn default() -> Self {
@@ -272,11 +288,11 @@ impl Map {
         self.inner.write().unwrap().big_change_idx += 1;
     }
 
-    pub fn get_last_big_change_idx(&self) -> i32 {
+    pub fn get_last_big_change_idx(&self) -> u32 {
         self.inner.read().unwrap().big_change_idx
     }
 
-    pub fn get_map_change_index(&self) -> i32 {
+    pub fn get_map_change_index(&self) -> u32 {
         self.inner.read().unwrap().map_change
     }
 
@@ -284,12 +300,24 @@ impl Map {
         self.inner.write().unwrap().map_change += 1;
     }
 
-    pub fn get_last_map_change(&self) -> i32 {
+    pub fn get_last_map_change(&self) -> u32 {
         self.inner.read().unwrap().map_change_notified
     }
 
-    pub fn set_last_map_change(&self, current_change_id: i32) {
+    pub fn set_last_map_change(&self, current_change_id: u32) {
         self.inner.write().unwrap().map_change_notified = current_change_id;
+    }
+
+    pub fn pre_save(&mut self, cams: &Vec<Arc<dyn GeometricCamera>>) {
+        // TODO
+    }
+
+    pub fn post_load(
+        &mut self,
+        key_frame_database: Arc<KeyFrameDatabase>,
+        orb_voc: Arc<OrbVocabulary>,
+    ) {
+        // TODO
     }
 
     // IMU / inertial flags

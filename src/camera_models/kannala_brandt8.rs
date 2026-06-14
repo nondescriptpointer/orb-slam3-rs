@@ -7,6 +7,7 @@ use opencv::{
     },
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::{
     camera_models::{GeometricCamera, Type, next_geometric_camera_id},
@@ -198,26 +199,6 @@ impl KannalaBrandt8 {
         }
 
         Ok(TriangulateMatchesResult { z1, p3d: x3d })
-    }
-
-    fn is_equal(&self, other: &dyn GeometricCamera) -> bool {
-        let Some(other) = other.as_any().downcast_ref::<KannalaBrandt8>() else {
-            return false;
-        };
-        if self.size() != other.size() {
-            return false;
-        }
-        let mut is_same = true;
-        for i in 0..self.size() {
-            if (self.parameters[i] - other.parameters[i]).abs() > 1e-6 {
-                is_same = false;
-                break;
-            }
-        }
-        if (self.precision - other.precision).abs() > 1e-6 {
-            is_same = false;
-        }
-        is_same
     }
 }
 
@@ -587,6 +568,26 @@ impl GeometricCamera for KannalaBrandt8 {
 
     fn get_type(&self) -> Type {
         self.camera_type
+    }
+
+    fn is_equal(&self, other: &Arc<dyn GeometricCamera>) -> bool {
+        let Some(other) = other.as_any().downcast_ref::<KannalaBrandt8>() else {
+            return false;
+        };
+        if self.size() != other.size() {
+            return false;
+        }
+        let mut is_same = true;
+        for i in 0..self.size() {
+            if (self.parameters[i] - other.parameters[i]).abs() > 1e-6 {
+                is_same = false;
+                break;
+            }
+        }
+        if (self.precision - other.precision).abs() > 1e-6 {
+            is_same = false;
+        }
+        is_same
     }
 }
 

@@ -397,7 +397,7 @@ impl MapPoint {
             }
         }
         if let Some(map) = self.map.read().unwrap().clone() {
-            map.erase_map_point(self.id);
+            map.erase_map_point(self);
         }
     }
 
@@ -449,7 +449,7 @@ impl MapPoint {
         other.compute_distinctive_descriptors();
 
         if let Some(map) = self.map.read().unwrap().clone() {
-            map.erase_map_point(self.id);
+            map.erase_map_point(self);
         }
     }
 

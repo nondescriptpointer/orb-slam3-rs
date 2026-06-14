@@ -21,6 +21,12 @@ fn next_geometric_camera_id() -> u64 {
 }
 
 // TODO: serialize
+// NOTE: not yet `Send + Sync`. opencv's `KeyPoint` carries an FFI pointer and is
+// `!Sync` in this binding (see `SendKeyPoints` in two_view_reconstruction), which
+// transitively makes cameras / frames / keyframes `!Sync`. The `RwLock` interior
+// mutability on `KeyFrame`/`MapPoint` is the right shape for the eventual
+// multi-threaded design; flipping these to `Send + Sync` waits on a `KeyPoint`
+// wrapper and is tracked with the broader threading work.
 pub trait GeometricCamera {
     fn new() -> Self
     where

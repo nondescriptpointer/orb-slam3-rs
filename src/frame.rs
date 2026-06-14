@@ -224,7 +224,7 @@ pub struct Frame {
     #[cfg(feature = "register-times")]
     pub time_stereo_match: f64,
 
-    // Optimization constraint (`mpcpi` in C++); set by the optimizer.
+    // Optimization constraint set by the optimizer.
     pub cpi: Option<ConstraintPoseIMU>,
 
     // nalgebra migration
@@ -391,7 +391,7 @@ impl Frame {
         let descriptors_right = right_res.descriptors.unwrap_or_default();
         let n = keys.len();
 
-        // Undistort keypoints (no-op for already-rectified images, but matches C++).
+        // Undistort keypoints (no-op for already-rectified images).
         let keys_un =
             undistort_keypoints(&constants.dist_coef, &camera.to_k(), &constants.k, &keys);
 
@@ -999,7 +999,6 @@ impl Frame {
 
     /// Check whether a [`MapPoint`] falls in the camera frustum and, if so,
     /// return the projection data for the left and/or right camera.
-    ///
     /// Unlike the C++ version this does not mutate the `MapPoint`.
     pub fn is_in_frustum(&self, mp: &MapPoint, viewing_cos_limit: f32) -> FrustumResult {
         if self.n_left.is_none() {
@@ -1341,7 +1340,7 @@ impl FrameConstants {
     /// distortion-coefficient vector; pass an empty `Mat` (or one whose first
     /// element is zero) for cameras that don't use OpenCV-style distortion
     /// (e.g. fisheye/Kannala–Brandt), in which case the raw image rectangle is
-    /// used as the bounds — matching the C++ behaviour.
+    /// used as the bounds
     pub fn new(
         k: Mat,
         dist_coef: Mat,
@@ -1906,5 +1905,195 @@ fn compute_stereo_fisheye_matches(
         u_right,
         depth,
         stereo_3d_points,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::excessive_precision, clippy::arc_with_non_send_sync)]
+    use std::sync::Arc;
+
+    use nalgebra::Vector3;
+    use opencv::core::KeyPointTrait;
+
+    use super::*;
+    use crate::map::Map;
+    use crate::map_point::MapPoint;
+    use crate::test_helpers::*;
+
+    #[test]
+    fn image_bounds_and_intrinsics() {
+        let c = constants();
+        let b = &c.bounds;
+        assert!(approx(b.min_x, -135.795639, 1e-2), "min_x={}", b.min_x);
+        assert!(approx(b.max_x, 895.507324, 1e-2), "max_x={}", b.max_x);
+        assert!(approx(b.min_y, -92.875015, 1e-2), "min_y={}", b.min_y);
+        assert!(approx(b.max_y, 565.553101, 1e-2), "max_y={}", b.max_y);
+        assert!(approx(b.grid_w_inv, 0.062057417, 1e-6));
+        assert!(approx(b.grid_h_inv, 0.072900899, 1e-6));
+
+        let i = &c.intrinsics;
+        assert!(approx(i.fx, FX, 1e-2) && approx(i.fy, FY, 1e-2));
+        assert!(approx(i.cx, CX, 1e-2) && approx(i.cy, CY, 1e-2));
+    }
+
+    #[test]
+    fn pose_matrices() {
+        let mut f = build_frame();
+        f.set_pose(make_pose());
+
+        assert_vec(f.get_ow(), [-1.0, -2.0, -3.0], 1e-4);
+        assert_vec(f.get_camera_center(), [-1.0, -2.0, -3.0], 1e-4);
+        assert_mat3(
+            f.get_rwc(),
+            [
+                0.935754836,
+                0.302932680,
+                -0.180540055,
+                -0.283164918,
+                0.950580657,
+                0.127334565,
+                0.210191682,
+                -0.068031318,
+                0.975290298,
+            ],
+            1e-4,
+        );
+        assert!(f.has_pose());
+        assert!(f.is_set());
+    }
+
+    #[test]
+    fn imu_getters() {
+        let mut f = build_frame();
+        f.set_pose(make_pose());
+
+        assert_vec(
+            f.get_imu_position(),
+            [-1.038241386, -1.966795921, -3.020858765],
+            1e-4,
+        );
+        assert_mat3(
+            f.get_imu_rotation(),
+            [
+                0.929613411,
+                0.332612872,
+                -0.158706099,
+                -0.314113677,
+                0.940329552,
+                0.130816728,
+                0.192747355,
+                -0.071757227,
+                0.978621125,
+            ],
+            1e-4,
+        );
+        assert_vec(
+            f.get_imu_pose().translation.vector,
+            [-1.038241386, -1.966795921, -3.020858765],
+            1e-4,
+        );
+    }
+
+    #[test]
+    fn in_ref_coordinates_applies_rcw_p_plus_tcw() {
+        let mut f = build_frame();
+        f.set_pose(make_pose());
+        let got = f.in_ref_coordinates(Vector3::new(0.5, -0.3, 4.0));
+        assert_vec(got, [2.393593788, 1.594166875, 6.772690773], 1e-4);
+    }
+
+    #[test]
+    fn unproject_stereo_backprojects_keypoint() {
+        let mut f = build_frame();
+        f.set_pose(make_pose());
+
+        f.keys_un = Some(vec![keypoint(400.0, 300.0)]);
+        f.depth = vec![2.5];
+
+        let x3d = f.unproject_stereo(0).expect("has depth");
+        assert_vec(x3d, [-1.198632002, -1.463983774, -0.543413162], 1e-3);
+
+        f.depth[0] = -1.0;
+        assert!(f.unproject_stereo(0).is_none());
+    }
+
+    #[test]
+    fn get_features_in_area() {
+        let mut f = build_frame();
+        let c = f.constants.clone();
+
+        f.n = 3;
+        let kps = vec![
+            keypoint(100.0, 100.0),
+            keypoint(105.0, 103.0),
+            keypoint(400.0, 300.0),
+        ];
+        f.keys_un = Some(kps.clone());
+
+        let mut grid = vec![Vec::<usize>::new(); FRAME_GRID_COLS * FRAME_GRID_ROWS];
+        for (i, kp) in kps.iter().enumerate() {
+            let (gx, gy) = pos_in_grid(kp, &c.bounds).unwrap();
+            grid[grid_index(gx, gy)].push(i);
+        }
+        f.grid = grid;
+
+        let mut near = f.get_features_in_area(100.0, 100.0, 10.0, -1, -1, false);
+        near.sort();
+        assert_eq!(near, vec![0, 1]);
+
+        assert!(
+            f.get_features_in_area(600.0, 50.0, 5.0, -1, -1, false)
+                .is_empty()
+        );
+
+        let far = f.get_features_in_area(400.0, 300.0, 10.0, -1, -1, false);
+        assert_eq!(far, vec![2]);
+    }
+
+    #[test]
+    fn project_point_distort() {
+        let mut f = build_frame();
+        f.set_pose(make_pose());
+
+        let mp = Arc::new(MapPoint::new());
+        mp.set_world_pos(Vector3::new(-1.772220612, -1.225883961, 2.907996178));
+
+        let kp = f.project_point_distort(&mp).expect("in front");
+        assert!(approx(kp.x, 390.129882812, 1e-2), "u={}", kp.x);
+        assert!(approx(kp.y, 255.990905762, 1e-2), "v={}", kp.y);
+    }
+
+    #[test]
+    fn is_in_frustum() {
+        let mut f = build_frame();
+        f.set_pose(make_pose());
+        assert!(f.n > 0);
+        f.keys_un.as_mut().unwrap()[0].set_octave(0);
+
+        let map = Arc::new(Map::new());
+        let cam_pt = Vector3::new(0.2, 0.1, 5.0);
+        let world = f.get_rwc() * cam_pt + f.get_ow();
+        let mp = MapPoint::from_frame(&world, map, &f, 0);
+
+        let res = f.is_in_frustum(&mp, 0.5);
+        assert!(res.in_view());
+        let t = res.left.expect("left projection");
+        assert!(approx(t.proj_x, 385.561157227, 1e-2), "projX={}", t.proj_x);
+        assert!(approx(t.proj_y, 257.520935059, 1e-2), "projY={}", t.proj_y);
+        assert!(
+            approx(t.proj_xr, 342.447692871, 1e-2),
+            "projXR={}",
+            t.proj_xr
+        );
+        assert!(approx(t.depth, 5.004997730, 1e-3), "depth={}", t.depth);
+        assert_eq!(t.scale_level, 0);
+        assert!(approx(t.view_cos, 1.0, 1e-4), "viewCos={}", t.view_cos);
+
+        // Behind the camera -> not in view.
+        let world_behind = f.get_rwc() * Vector3::new(0.2, 0.1, -5.0) + f.get_ow();
+        let mp2 = Arc::new(MapPoint::new());
+        mp2.set_world_pos(world_behind);
+        assert!(!f.is_in_frustum(&mp2, 0.5).in_view());
     }
 }

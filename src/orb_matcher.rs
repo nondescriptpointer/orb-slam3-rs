@@ -1361,7 +1361,7 @@ impl OrbMatcher {
         let t2w = kf2.get_pose();
         let tw2 = kf2.get_pose_inverse(); // for convenience
         let cw = kf1.get_camera_center();
-        let c2 = t2w * Point3::from(*cw);
+        let c2 = t2w * Point3::from(cw);
         let ep = kf2.camera.project_n(&c2);
 
         // Decompose an isometry into (R, t)
@@ -1570,7 +1570,7 @@ impl OrbMatcher {
     // Used in Local Mapping.
     pub fn fuse(
         &self,
-        kf: &KeyFrame,
+        kf: &Arc<KeyFrame>,
         map_points: &[Option<Arc<MapPoint>>],
         th: f32,
         right: bool,
@@ -1582,7 +1582,7 @@ impl OrbMatcher {
                 kf.camera2.as_ref().expect("camera2"),
             )
         } else {
-            (*kf.get_pose(), *kf.get_camera_center(), &kf.camera)
+            (kf.get_pose(), kf.get_camera_center(), &kf.camera)
         };
         let bf = kf.bf;
 
@@ -1683,7 +1683,7 @@ impl OrbMatcher {
 
             // If there is already a MapPoint replace, otherwise add a new one.
             if best_dist <= TH_LOW {
-                if let Some(mp_in_kf) = kf.get_map_point(best_idx) {
+                if let Some(mp_in_kf) = kf.get_map_point(best_idx as usize) {
                     if !mp_in_kf.is_bad() {
                         if mp_in_kf.observations() > mp.observations() {
                             mp.replace(&mp_in_kf);
@@ -1693,7 +1693,7 @@ impl OrbMatcher {
                     }
                 } else {
                     mp.add_observation(kf, best_idx);
-                    kf.add_map_point(mp.clone(), best_idx);
+                    kf.add_map_point(mp.clone(), best_idx as usize);
                 }
                 n_fused += 1;
             }
@@ -1707,7 +1707,7 @@ impl OrbMatcher {
     // `replace_points` (to be replaced by the caller). Used in Loop Closing.
     pub fn fuse_by_sim3(
         &self,
-        kf: &KeyFrame,
+        kf: &Arc<KeyFrame>,
         scw: &Similarity3<f32>,
         points: &[Arc<MapPoint>],
         th: f32,
@@ -1784,13 +1784,13 @@ impl OrbMatcher {
 
             // If there is already a MapPoint replace, otherwise add a new one.
             if best_dist <= TH_LOW {
-                if let Some(mp_in_kf) = kf.get_map_point(best_idx) {
+                if let Some(mp_in_kf) = kf.get_map_point(best_idx as usize) {
                     if !mp_in_kf.is_bad() {
                         replace_points[i_mp] = Some(mp_in_kf);
                     }
                 } else {
                     mp.add_observation(kf, best_idx);
-                    kf.add_map_point(mp.clone(), best_idx);
+                    kf.add_map_point(mp.clone(), best_idx as usize);
                 }
                 n_fused += 1;
             }

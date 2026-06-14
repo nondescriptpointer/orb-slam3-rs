@@ -16,4 +16,6 @@ pub mod orb_vocabulary;
 pub mod serialization_utils;
 pub mod settings;
 pub mod system;
+#[cfg(test)]
+mod test_helpers;
 pub mod two_view_reconstruction;

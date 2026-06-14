@@ -92,6 +92,43 @@ impl<'de> Deserialize<'de> for Atlas {
     }
 }
 
+/// Magic bytes prefixing a serialized atlas blob (`"ORBA"`).
+const ATLAS_MAGIC: [u8; 4] = *b"ORBA";
+/// On-disk schema version. Bump whenever a `*Snapshot` layout changes so that
+/// older blobs fail loudly instead of decoding to garbage (the wire format is
+/// not self-describing).
+const ATLAS_FORMAT_VERSION: u32 = 1;
+
+/// Error returned by [`Atlas::to_bytes`] / [`Atlas::from_bytes`].
+#[derive(Debug)]
+pub enum AtlasIoError {
+    /// The blob is shorter than the 8-byte header.
+    Truncated,
+    /// The leading magic bytes did not match [`ATLAS_MAGIC`].
+    BadMagic,
+    /// The header version is not [`ATLAS_FORMAT_VERSION`].
+    UnsupportedVersion(u32),
+    /// The postcard codec failed.
+    Postcard(postcard::Error),
+}
+
+impl std::fmt::Display for AtlasIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AtlasIoError::Truncated => write!(f, "atlas blob is truncated"),
+            AtlasIoError::BadMagic => write!(f, "atlas blob has invalid magic"),
+            AtlasIoError::UnsupportedVersion(v) => {
+                write!(
+                    f,
+                    "unsupported atlas format version {v} (expected {ATLAS_FORMAT_VERSION})"
+                )
+            }
+            AtlasIoError::Postcard(e) => write!(f, "postcard codec error: {e}"),
+        }
+    }
+}
+impl std::error::Error for AtlasIoError {}
+
 pub struct Atlas {
     maps: HashMap<u32, Arc<Map>>,
 
@@ -359,6 +396,38 @@ impl Atlas {
         for map in self.maps.values() {
             map.post_load(db.clone(), voc.clone());
         }
+    }
+
+    /// Serialize the atlas to a self-contained binary blob (magic + version
+    /// header followed by a postcard-encoded [`AtlasSnapshot`]).
+    ///
+    /// Call [`pre_save`](Atlas::pre_save) first to drop empty maps and clean up
+    /// cross-map observations.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, AtlasIoError> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&ATLAS_MAGIC);
+        out.extend_from_slice(&ATLAS_FORMAT_VERSION.to_le_bytes());
+        let body = postcard::to_allocvec(self).map_err(AtlasIoError::Postcard)?;
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Reconstruct an atlas from a blob produced by [`to_bytes`](Atlas::to_bytes).
+    ///
+    /// The keyframe database and ORB vocabulary are *not* restored here; set them
+    /// with [`set_key_frame_database`](Atlas::set_key_frame_database) /
+    /// [`set_orb_vocabulary`](Atlas::set_orb_vocabulary) and call
+    /// [`post_load`](Atlas::post_load) to finish wiring.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Atlas, AtlasIoError> {
+        let (header, body) = bytes.split_at_checked(8).ok_or(AtlasIoError::Truncated)?;
+        if header[..4] != ATLAS_MAGIC {
+            return Err(AtlasIoError::BadMagic);
+        }
+        let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        if version != ATLAS_FORMAT_VERSION {
+            return Err(AtlasIoError::UnsupportedVersion(version));
+        }
+        postcard::from_bytes(body).map_err(AtlasIoError::Postcard)
     }
 
     pub fn get_atlas_key_frames(&self) -> HashMap<u64, Arc<KeyFrame>> {
@@ -686,6 +755,75 @@ mod tests {
         assert_eq!(rmp.get_map().expect("mp map").get_id(), rmap.get_id());
 
         // Camera link + pose preserved.
+        assert_eq!(ra.camera.get_id(), cam.get_id());
+        let dt = (ra.get_pose().translation.vector - a.get_pose().translation.vector).norm();
+        assert!(dt < 1e-5, "pose drift {dt}");
+    }
+
+    /// True end-to-end test of the atlas `Serialize` / `Deserialize` impls:
+    /// `Atlas -> bytes -> Atlas` through the postcard wire format.
+    #[test]
+    fn atlas_serde_end_to_end() {
+        use crate::map_point::MapPoint;
+        use nalgebra::Vector3;
+
+        let mut atlas = Atlas::new();
+        atlas.create_new_map();
+        let map = atlas.get_current_map();
+
+        let frame = build_frame();
+        let cam = atlas.add_camera(frame.camera.clone());
+        let a = KeyFrame::from_frame(&frame, map.clone());
+        let b = KeyFrame::from_frame(&frame, map.clone());
+        a.set_pose(crate::test_helpers::make_pose());
+        map.add_key_frame(a.clone());
+        map.add_key_frame(b.clone());
+        map.add_key_frame_origin(a.clone());
+        a.add_connection(&b, 7);
+        b.add_connection(&a, 7);
+        b.change_parent(&a);
+        let mp = MapPoint::from_frame(&Vector3::new(1.0, 2.0, 3.0), map.clone(), &frame, 0);
+        map.add_map_point(mp.clone());
+        mp.add_observation(&a, 0);
+
+        atlas.pre_save();
+
+        // Full wire round-trip through postcard (magic + version header + body).
+        let bytes = atlas.to_bytes().expect("serialize atlas");
+        assert_eq!(&bytes[..4], b"ORBA");
+        let restored = Atlas::from_bytes(&bytes).expect("deserialize atlas");
+
+        // Corrupting the magic / version is rejected.
+        let mut bad = bytes.clone();
+        bad[0] ^= 0xFF;
+        assert!(matches!(
+            Atlas::from_bytes(&bad),
+            Err(AtlasIoError::BadMagic)
+        ));
+
+        // Top-level structure + cameras + counters.
+        assert_eq!(restored.count_maps(), 1);
+        assert_eq!(restored.get_all_cameras().len(), 1);
+        assert_eq!(restored.get_all_cameras()[0].get_id(), cam.get_id());
+        assert_eq!(restored.get_last_init_kf_id(), atlas.get_last_init_kf_id());
+
+        // Map contents.
+        let rmap = restored.get_all_maps()[0].clone();
+        assert_eq!(rmap.get_id(), map.get_id());
+        assert_eq!(rmap.key_frames_in_map(), 2);
+        assert_eq!(rmap.map_points_in_map(), 1);
+
+        // Graph: covisibility weight, spanning tree, origin.
+        let kfs = restored.get_atlas_key_frames();
+        let ra = kfs.get(&a.id).expect("a restored").clone();
+        let rb = kfs.get(&b.id).expect("b restored").clone();
+        assert_eq!(ra.get_weight(&rb), 7);
+        assert_eq!(rb.get_parent().expect("parent").id, a.id);
+        assert_eq!(rmap.get_origin_kf().expect("origin").id, a.id);
+
+        // Observation + camera + pose.
+        let rmp = rmap.get_all_map_points()[0].clone();
+        assert_eq!(rmp.get_observations()[0].0.id, a.id);
         assert_eq!(ra.camera.get_id(), cam.get_id());
         let dt = (ra.get_pose().translation.vector - a.get_pose().translation.vector).norm();
         assert!(dt < 1e-5, "pose drift {dt}");

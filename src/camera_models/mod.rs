@@ -112,8 +112,11 @@ impl std::fmt::Debug for dyn GeometricCamera {
     }
 }
 
+// Externally tagged (serde default): encodes as a `u32` variant index plus the
+// payload, which is what non-self-describing binary formats like postcard need.
+// Avoid `#[serde(tag = ...)]` here — adjacently/internally tagged enums can route
+// through `deserialize_any`, which postcard does not support.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "data")]
 pub enum GeometricCameraSnapshot {
     Pinhole(pinhole::Pinhole),
     KannalaBrandt8(kannala_brandt8::KannalaBrandt8),

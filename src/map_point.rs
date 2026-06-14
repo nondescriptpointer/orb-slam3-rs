@@ -35,8 +35,19 @@ use crate::key_frame::KeyFrame;
 use crate::key_frame_database::KeyFrameId;
 use crate::map::Map;
 use crate::orb_matcher::descriptor_distance;
+use crate::serialization_utils::SerializableMat;
+use serde::{Deserialize, Serialize};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
+/// Current value of the global map-point-id counter (for serialization).
+pub(crate) fn peek_next_id() -> usize {
+    NEXT_ID.load(Ordering::SeqCst)
+}
+/// Restore the global map-point-id counter (after deserialization).
+pub(crate) fn set_next_id(v: usize) {
+    NEXT_ID.store(v, Ordering::SeqCst);
+}
 
 /// A live observation: an observing keyframe and its `(left, right)` indices.
 type LiveObservation = (Arc<KeyFrame>, (i32, i32));
@@ -630,6 +641,127 @@ impl MapPoint {
     }
     pub fn update_map(&self, map: Arc<Map>) {
         *self.map.write().unwrap() = Arc::downgrade(&map);
+    }
+}
+
+/// Serde-friendly snapshot of a [`MapPoint`].
+#[derive(Serialize, Deserialize)]
+pub(crate) struct MapPointSnapshot {
+    pub(crate) id: usize,
+    first_kf_id: Option<u64>,
+    first_frame: usize,
+    n_obs: i32,
+    world_pos: Vector3<f32>,
+    normal_vector: Vector3<f32>,
+    /// `(observing keyframe id, left index)` — mirrors `mBackupObservationsId1`.
+    obs_left: Vec<(u64, i32)>,
+    /// `(observing keyframe id, right index)` — mirrors `mBackupObservationsId2`.
+    obs_right: Vec<(u64, i32)>,
+    descriptor: SerializableMat,
+    ref_kf_id: Option<u64>,
+    bad: bool,
+    replaced_id: Option<usize>,
+    min_distance: f32,
+    max_distance: f32,
+}
+
+impl MapPoint {
+    /// Capture this point's serializable state (`MapPoint::PreSave`).
+    pub(crate) fn to_snapshot(&self) -> MapPointSnapshot {
+        let pos = self.pos.read().unwrap();
+        let feat = self.feat.read().unwrap();
+        let mut obs_left = Vec::with_capacity(feat.observations.len());
+        let mut obs_right = Vec::with_capacity(feat.observations.len());
+        for (kf_id, o) in feat.observations.iter() {
+            obs_left.push((kf_id.0, o.left));
+            obs_right.push((kf_id.0, o.right));
+        }
+        MapPointSnapshot {
+            id: self.id,
+            first_kf_id: self.first_kf_id,
+            first_frame: self.first_frame,
+            n_obs: feat.n_obs,
+            world_pos: pos.world_pos,
+            normal_vector: pos.normal_vector,
+            obs_left,
+            obs_right,
+            descriptor: SerializableMat::from_mat(&feat.descriptor)
+                .expect("serialize map point descriptor"),
+            ref_kf_id: feat.ref_kf.upgrade().map(|k| k.id),
+            bad: feat.bad,
+            replaced_id: feat.replaced.as_ref().map(|m| m.id),
+            min_distance: pos.min_distance,
+            max_distance: pos.max_distance,
+        }
+    }
+
+    /// Build a link-less map point shell from a backup. Observation / reference
+    /// / replaced links are wired separately in [`MapPoint::restore_links`].
+    pub(crate) fn from_snapshot(b: &MapPointSnapshot, origin_map_id: u32) -> Arc<MapPoint> {
+        let mp = Self::build(
+            b.id,
+            b.first_kf_id,
+            b.first_frame,
+            origin_map_id,
+            b.world_pos,
+            b.normal_vector,
+            b.min_distance,
+            b.max_distance,
+            Weak::new(),
+            b.descriptor
+                .to_mat()
+                .expect("deserialize map point descriptor"),
+            None,
+        );
+        {
+            let mut feat = mp.feat.write().unwrap();
+            feat.n_obs = b.n_obs;
+            feat.bad = b.bad;
+        }
+        Arc::new(mp)
+    }
+
+    /// Re-establish observation / reference / replaced links from ids
+    /// (`MapPoint::PostLoad`).
+    pub(crate) fn restore_links(
+        &self,
+        b: &MapPointSnapshot,
+        kfs: &HashMap<u64, Arc<KeyFrame>>,
+        mps: &HashMap<usize, Arc<MapPoint>>,
+    ) {
+        let mut feat = self.feat.write().unwrap();
+
+        // Merge the left/right id maps back into single observations.
+        let mut merged: HashMap<u64, (i32, i32)> = HashMap::new();
+        for (id, left) in &b.obs_left {
+            merged.entry(*id).or_insert((-1, -1)).0 = *left;
+        }
+        for (id, right) in &b.obs_right {
+            merged.entry(*id).or_insert((-1, -1)).1 = *right;
+        }
+        for (kf_id, (left, right)) in merged {
+            if let Some(kf) = kfs.get(&kf_id) {
+                feat.observations.insert(
+                    KeyFrameId(kf_id),
+                    Observation {
+                        kf: Arc::downgrade(kf),
+                        left,
+                        right,
+                    },
+                );
+            }
+        }
+
+        if let Some(rid) = b.ref_kf_id
+            && let Some(kf) = kfs.get(&rid)
+        {
+            feat.ref_kf = Arc::downgrade(kf);
+        }
+        if let Some(rep) = b.replaced_id
+            && let Some(mp) = mps.get(&rep)
+        {
+            feat.replaced = Some(mp.clone());
+        }
     }
 }
 

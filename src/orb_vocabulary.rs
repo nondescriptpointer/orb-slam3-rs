@@ -53,7 +53,7 @@ pub type NodeId = u32;
 
 /// Sparse bag-of-words vector: `word_id -> weight`. Kept sorted by id so the
 /// L1 scoring routine can do a single linear merge.
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BowVector(pub BTreeMap<WordId, f64>);
 
 impl BowVector {
@@ -85,7 +85,7 @@ impl BowVector {
 /// Sparse feature vector: `node_id -> indices of input features that
 /// descended through this node at the chosen level`. Used by ORB-SLAM3 to
 /// restrict descriptor matching to features under the same vocabulary node.
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FeatureVector(pub BTreeMap<NodeId, Vec<u32>>);
 
 impl FeatureVector {

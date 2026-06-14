@@ -68,6 +68,15 @@ use crate::orb_vocabulary::{BowVector, DESC_LEN, Descriptor, FeatureVector, OrbV
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
 
+/// Current value of the global frame-id counter (for serialization).
+pub(crate) fn peek_next_frame_id() -> usize {
+    NEXT_ID.load(Ordering::SeqCst)
+}
+/// Restore the global frame-id counter (after deserialization).
+pub(crate) fn set_next_frame_id(v: usize) {
+    NEXT_ID.store(v, Ordering::SeqCst);
+}
+
 /// Lock-free boolean flag with `Clone` semantics suitable for a `#[derive(Clone)]`
 /// struct: cloning snapshots the current value into a fresh atomic.
 ///

@@ -23,20 +23,32 @@
 //! discipline as [`crate::map_point`]: snapshot the membership under the lock,
 //! release it, then call into the keyframes / map points.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use nalgebra::Isometry3;
 
+use serde::{Deserialize, Serialize};
+
 use crate::camera_models::GeometricCamera;
-use crate::key_frame::KeyFrame;
-use crate::key_frame_database::{self, KeyFrameDatabase};
-use crate::map_point::MapPoint;
+use crate::camera_models::pinhole::Pinhole;
+use crate::key_frame::{KeyFrame, KeyFrameSnapshot};
+use crate::key_frame_database::{KeyFrameDatabase, KeyFrameId};
+use crate::map_point::{MapPoint, MapPointSnapshot};
 use crate::orb_vocabulary::OrbVocabulary;
 
 static NEXT_MAP_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Current value of the global map-id counter (for serialization).
+pub(crate) fn peek_next_map_id() -> u32 {
+    NEXT_MAP_ID.load(Ordering::SeqCst)
+}
+/// Restore the global map-id counter (after deserialization).
+pub(crate) fn set_next_map_id(v: u32) {
+    NEXT_MAP_ID.store(v, Ordering::SeqCst);
+}
 
 /// Thumbnail size used by the atlas viewer (always a power of 2).
 pub const THUMB_WIDTH: usize = 512;
@@ -76,6 +88,24 @@ struct MapInner {
     is_in_use: bool,
     has_thumbnail: bool,
     bad: bool,
+}
+
+/// Serde-friendly snapshot of a [`Map`].
+#[derive(Serialize, Deserialize)]
+pub(crate) struct MapSnapshot {
+    id: u32,
+    init_kf_id: u64,
+    max_kf_id: u64,
+    big_change_idx: u32,
+    keyframes: Vec<KeyFrameSnapshot>,
+    map_points: Vec<MapPointSnapshot>,
+    kf_origins_id: Vec<u64>,
+    kf_initial_id: Option<u64>,
+    kf_lower_id: Option<u64>,
+    imu_initialized: bool,
+    is_inertial: bool,
+    imu_ba1: bool,
+    imu_ba2: bool,
 }
 
 /// One reconstruction: its keyframes, map points and shared state
@@ -308,15 +338,13 @@ impl Map {
         self.inner.write().unwrap().map_change_notified = current_change_id;
     }
 
-    /// Prepare the map for serialization.
+    /// Prepare the map for serialization (`Map::PreSave`, graph-maintenance part).
     ///
-    /// Ports the graph-maintenance half of ORB-SLAM3's `Map::PreSave`: every
-    /// observation that references a keyframe belonging to a *different* map (or
-    /// a bad keyframe) is dropped, so the saved map is self-contained.
-    ///
-    /// NOTE: the pointer→id backup conversion (`mvpBackupMapPoints`,
-    /// `mvpBackupKeyFrames`, `mnBackupKF*`, and the per-keyframe / per-point
-    /// `PreSave`) is deferred until the serde serialization layer exists.
+    /// Every observation that references a keyframe belonging to a *different*
+    /// map (or a bad keyframe) is dropped, so the snapshot produced by
+    /// [`Map::to_snapshot`] is self-contained. The pointer→id conversion itself is
+    /// done lazily by `to_snapshot`, so there is no separate backup-vector step
+    /// (the C++ `mvpBackupKeyFrames` / `mvpBackupMapPoints`).
     pub fn pre_save(&self, _cams: &[Arc<dyn GeometricCamera>]) {
         let this_id = self.get_id();
         for mp in self.get_all_map_points() {
@@ -332,29 +360,140 @@ impl Map {
         }
     }
 
-    /// Re-establish references after deserialization.
+    /// Finalize a freshly deserialized map (`Map::PostLoad`, external-resource part).
     ///
-    /// Ports the back-pointer rewiring of ORB-SLAM3's `Map::PostLoad`
-    /// (`UpdateMap(this)`): each keyframe and map point is re-pointed at this
-    /// map. This is essential because the `map` back-pointers are [`Weak`] and
-    /// would be dangling on a freshly loaded graph.
-    ///
-    /// NOTE: wiring the ORB vocabulary / keyframe database into each keyframe,
-    /// re-adding keyframes to the database, and rebuilding
-    /// `kf_initial` / `kf_lower` / origins from their backup ids is deferred
-    /// until the serde serialization layer exists.
+    /// The keyframe / map-point graph and every back-pointer are already wired
+    /// by [`Map::from_snapshot`]; this step only registers each keyframe with the
+    /// keyframe database (C++ `pKFDB->add(pKFi)`). The ORB vocabulary is accepted
+    /// for parity with the C++ signature but is already embedded in the database.
     pub fn post_load(
-        self: &Arc<Self>,
-        _key_frame_database: Arc<KeyFrameDatabase>,
+        &self,
+        key_frame_database: Arc<KeyFrameDatabase>,
         _orb_voc: Arc<OrbVocabulary>,
-        _cams: Arc<HashMap<u64, Arc<dyn GeometricCamera>>>,
     ) {
         for kf in self.get_all_key_frames() {
-            kf.update_map(self.clone());
+            key_frame_database.add(KeyFrameId(kf.id), &kf.bow_vec);
         }
-        for mp in self.get_all_map_points() {
-            mp.update_map(self.clone());
+    }
+
+    /// Capture this map's full serializable state (`Map::PreSave` snapshot).
+    ///
+    /// Bad keyframes and map points are skipped; the rest are converted to their
+    /// id-based [`KeyFrameSnapshot`] / [`MapPointSnapshot`] forms.
+    pub(crate) fn to_snapshot(&self) -> MapSnapshot {
+        let inner = self.inner.read().unwrap();
+        let keyframes = inner
+            .key_frames
+            .values()
+            .filter(|k| !k.is_bad())
+            .map(|k| k.to_snapshot())
+            .collect();
+        let map_points = inner
+            .map_points
+            .values()
+            .filter(|m| !m.is_bad())
+            .map(|m| m.to_snapshot())
+            .collect();
+        let kf_origins_id = self
+            .key_frame_origins
+            .read()
+            .unwrap()
+            .iter()
+            .map(|k| k.id)
+            .collect();
+        MapSnapshot {
+            id: self.get_id(),
+            init_kf_id: inner.init_kf_id,
+            max_kf_id: inner.max_kf_id,
+            big_change_idx: inner.big_change_idx,
+            keyframes,
+            map_points,
+            kf_origins_id,
+            kf_initial_id: inner.kf_initial.as_ref().map(|k| k.id),
+            kf_lower_id: inner.kf_lower.as_ref().map(|k| k.id),
+            imu_initialized: inner.imu_initialized,
+            is_inertial: inner.is_inertial,
+            imu_ba1: inner.imu_ba1,
+            imu_ba2: inner.imu_ba2,
         }
+    }
+
+    /// Reconstruct a live map from a backup (`Map::PostLoad` pointer rebuild).
+    ///
+    /// Keyframe / map-point shells are built first, then their links (and the
+    /// `Weak<Map>` back-pointers) are wired up, mirroring ORB-SLAM3's two-pass
+    /// `PostLoad`.
+    pub(crate) fn from_snapshot(
+        b: &MapSnapshot,
+        cams: &HashMap<u64, Arc<dyn GeometricCamera>>,
+    ) -> Arc<Map> {
+        let map = Map::new();
+        map.change_id(b.id);
+        {
+            let mut inner = map.inner.write().unwrap();
+            inner.init_kf_id = b.init_kf_id;
+            inner.max_kf_id = b.max_kf_id;
+            inner.big_change_idx = b.big_change_idx;
+            inner.imu_initialized = b.imu_initialized;
+            inner.is_inertial = b.is_inertial;
+            inner.imu_ba1 = b.imu_ba1;
+            inner.imu_ba2 = b.imu_ba2;
+        }
+        let map = Arc::new(map);
+
+        // Resolve a camera id against the loaded camera set, falling back to any
+        // available camera (and finally a default) so reconstruction never panics.
+        let resolve_cam = |id: Option<u64>| -> Arc<dyn GeometricCamera> {
+            id.and_then(|id| cams.get(&id).cloned())
+                .or_else(|| cams.values().next().cloned())
+                .unwrap_or_else(|| Arc::new(Pinhole::new()))
+        };
+
+        // Phase 1: build link-less shells, indexed by id.
+        let mut kfs: HashMap<u64, Arc<KeyFrame>> = HashMap::new();
+        for kb in &b.keyframes {
+            let camera = resolve_cam(kb.camera_id);
+            let camera2 = kb.camera2_id.and_then(|id| cams.get(&id).cloned());
+            let kf = KeyFrame::from_snapshot(kb, camera, camera2);
+            kfs.insert(kf.id, kf);
+        }
+        let mut mps: HashMap<usize, Arc<MapPoint>> = HashMap::new();
+        for mb in &b.map_points {
+            let mp = MapPoint::from_snapshot(mb, b.id);
+            mps.insert(mp.id, mp);
+        }
+
+        // Phase 2: wire links and re-point the map back-pointers.
+        for kb in &b.keyframes {
+            if let Some(kf) = kfs.get(&kb.id) {
+                kf.restore_links(kb, &kfs, &mps);
+                kf.update_map(map.clone());
+            }
+        }
+        for mb in &b.map_points {
+            if let Some(mp) = mps.get(&mb.id) {
+                mp.restore_links(mb, &kfs, &mps);
+                mp.update_map(map.clone());
+            }
+        }
+
+        // Register everything with the map.
+        {
+            let mut inner = map.inner.write().unwrap();
+            inner.key_frames = kfs.clone();
+            inner.map_points = mps.clone();
+            inner.kf_initial = b.kf_initial_id.and_then(|id| kfs.get(&id).cloned());
+            inner.kf_lower = b.kf_lower_id.and_then(|id| kfs.get(&id).cloned());
+        }
+        {
+            let mut origins = map.key_frame_origins.write().unwrap();
+            for id in &b.kf_origins_id {
+                if let Some(kf) = kfs.get(id) {
+                    origins.push(kf.clone());
+                }
+            }
+        }
+        map
     }
 
     // IMU / inertial flags

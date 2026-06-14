@@ -1,11 +1,96 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tracing::info;
 
 use crate::{
-    camera_models::GeometricCamera, key_frame::KeyFrame, key_frame_database::KeyFrameDatabase,
-    map::Map, map_point::MapPoint, orb_vocabulary::OrbVocabulary, viewer::Viewer,
+    camera_models::{GeometricCamera, GeometricCameraSnapshot},
+    key_frame::KeyFrame,
+    key_frame_database::KeyFrameDatabase,
+    map::{Map, MapSnapshot},
+    map_point::MapPoint,
+    orb_vocabulary::OrbVocabulary,
+    viewer::Viewer,
 };
+
+/// Serde-friendly snapshot of an [`Atlas`].
+#[derive(Serialize, Deserialize)]
+struct AtlasSnapshot {
+    maps: Vec<MapSnapshot>,
+    cameras: Vec<GeometricCameraSnapshot>,
+    last_init_kf_id_map: u64,
+    next_map_id: u32,
+    next_frame_id: usize,
+    next_key_frame_id: u64,
+    next_map_point_id: usize,
+    next_camera_id: u64,
+}
+
+impl Serialize for Atlas {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let maps = self
+            .maps
+            .values()
+            .filter(|m| !m.is_bad())
+            .map(|m| m.to_snapshot())
+            .collect();
+        let cameras = self
+            .cameras
+            .iter()
+            .filter_map(|c| GeometricCameraSnapshot::try_from(c.as_ref()).ok())
+            .collect();
+        AtlasSnapshot {
+            maps,
+            cameras,
+            last_init_kf_id_map: self.last_init_kf_id_map,
+            next_map_id: crate::map::peek_next_map_id(),
+            next_frame_id: crate::frame::peek_next_frame_id(),
+            next_key_frame_id: crate::key_frame::peek_next_id(),
+            next_map_point_id: crate::map_point::peek_next_id(),
+            next_camera_id: crate::camera_models::peek_next_camera_id(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Atlas {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let snapshot = AtlasSnapshot::deserialize(deserializer)?;
+
+        // Restore the global id counters so newly minted ids never collide with
+        // loaded ones.
+        crate::map::set_next_map_id(snapshot.next_map_id);
+        crate::frame::set_next_frame_id(snapshot.next_frame_id);
+        crate::key_frame::set_next_id(snapshot.next_key_frame_id);
+        crate::map_point::set_next_id(snapshot.next_map_point_id);
+        crate::camera_models::set_next_camera_id(snapshot.next_camera_id);
+
+        let cameras: Vec<Arc<dyn GeometricCamera>> = snapshot
+            .cameras
+            .into_iter()
+            .map(|c| Arc::from(c.into_boxed()))
+            .collect();
+        let cam_map: HashMap<u64, Arc<dyn GeometricCamera>> =
+            cameras.iter().map(|c| (c.get_id(), c.clone())).collect();
+
+        let mut maps = HashMap::new();
+        for mb in &snapshot.maps {
+            let map = Map::from_snapshot(mb, &cam_map);
+            maps.insert(map.get_id(), map);
+        }
+
+        Ok(Atlas {
+            maps,
+            bad_maps: HashMap::new(),
+            current_map: None,
+            cameras,
+            last_init_kf_id_map: snapshot.last_init_kf_id_map,
+            viewer: None,
+            key_frame_database: None,
+            orb_vocabulary: None,
+        })
+    }
+}
 
 pub struct Atlas {
     maps: HashMap<u32, Arc<Map>>,
@@ -218,7 +303,13 @@ impl Atlas {
         self.current_map.as_ref().map(|m| m.is_imu_initialized())
     }
 
-    // Function for garantee the correction of serialization of this object
+    /// Prepare the atlas for serialization (`Atlas::PreSave`).
+    ///
+    /// Advances `last_init_kf_id_map` past the current map's keyframes, drops
+    /// empty maps, and runs each surviving map's observation cleanup
+    /// ([`Map::pre_save`]). The actual pointer→id conversion happens lazily in
+    /// the [`Serialize`] implementation via [`Map::to_snapshot`]. Call this before
+    /// serializing the atlas.
     pub fn pre_save(&mut self) {
         if let Some(current_map) = self.current_map.as_ref() {
             let max = current_map.get_max_kf_id();
@@ -251,20 +342,22 @@ impl Atlas {
         self.remove_bad_maps();
     }
 
+    /// Finalize the atlas after deserialization (`Atlas::PostLoad`).
+    ///
+    /// The map / keyframe / map-point graph is rebuilt during deserialization
+    /// (see [`Map::from_snapshot`]); this only registers each map's keyframes with
+    /// the keyframe database. Requires [`set_key_frame_database`] and
+    /// [`set_orb_vocabulary`] to have been called first.
+    ///
+    /// [`set_key_frame_database`]: Atlas::set_key_frame_database
+    /// [`set_orb_vocabulary`]: Atlas::set_orb_vocabulary
     pub fn post_load(&mut self) {
-        let cams: Arc<HashMap<u64, Arc<dyn GeometricCamera>>> = Arc::new(
-            self.cameras
-                .iter()
-                .map(|it| (it.get_id(), it.clone()))
-                .collect(),
-        );
-
+        let (Some(db), Some(voc)) = (self.key_frame_database.clone(), self.orb_vocabulary.clone())
+        else {
+            return;
+        };
         for map in self.maps.values() {
-            map.post_load(
-                self.key_frame_database.as_ref().unwrap().clone(),
-                self.orb_vocabulary.as_ref().unwrap().clone(),
-                cams.clone(),
-            );
+            map.post_load(db.clone(), voc.clone());
         }
     }
 
@@ -513,5 +606,88 @@ mod tests {
         );
         // The surviving keyframe's back-pointer is now dangling, not a leak.
         assert!(kf.get_map().is_none());
+    }
+
+    /// Round-trip a map with a non-trivial graph through the snapshot form
+    /// ([`Map::to_snapshot`] / [`Map::from_snapshot`]) — the pointer↔id conversion
+    /// that backs the atlas [`Serialize`] / [`Deserialize`] impls — and assert
+    /// ids, the covisibility graph, the spanning tree, observations, origins and
+    /// the camera link are preserved.
+    ///
+    /// The serde wire format itself is exercised at compile time by the
+    /// `#[derive(Serialize, Deserialize)]` on the snapshot structs; this test
+    /// covers the substantive reconstruction logic without a format dependency.
+    #[test]
+    fn snapshot_round_trip_preserves_graph() {
+        use crate::map_point::MapPoint;
+        use nalgebra::Vector3;
+
+        let map = Arc::new(Map::new());
+
+        // Two keyframes built from a real frame (so descriptors / keypoints
+        // exist), sharing the frame's camera.
+        let frame = build_frame();
+        let cam = frame.camera.clone();
+        let a = KeyFrame::from_frame(&frame, map.clone());
+        let b = KeyFrame::from_frame(&frame, map.clone());
+        a.set_pose(crate::test_helpers::make_pose());
+        map.add_key_frame(a.clone());
+        map.add_key_frame(b.clone());
+        map.add_key_frame_origin(a.clone());
+
+        // Covisibility weight + spanning tree edge.
+        a.add_connection(&b, 42);
+        b.add_connection(&a, 42);
+        b.change_parent(&a);
+
+        // A map point observed by `a`.
+        let mp = MapPoint::from_frame(&Vector3::new(1.0, 2.0, 3.0), map.clone(), &frame, 0);
+        map.add_map_point(mp.clone());
+        mp.add_observation(&a, 0);
+
+        // Round-trip through the serializable snapshot form.
+        let snapshot = map.to_snapshot();
+        let cam_map: HashMap<u64, Arc<dyn GeometricCamera>> =
+            HashMap::from([(cam.get_id(), cam.clone())]);
+        let rmap = Map::from_snapshot(&snapshot, &cam_map);
+
+        // Map / keyframe / map-point counts and id.
+        assert_eq!(rmap.get_id(), map.get_id());
+        assert_eq!(rmap.key_frames_in_map(), 2);
+        assert_eq!(rmap.map_points_in_map(), 1);
+
+        // Keyframe ids preserved; look them up in the restored map.
+        let r_kfs: HashMap<u64, _> = rmap
+            .get_all_key_frames()
+            .into_iter()
+            .map(|k| (k.id, k))
+            .collect();
+        let ra = r_kfs.get(&a.id).expect("keyframe a restored").clone();
+        let rb = r_kfs.get(&b.id).expect("keyframe b restored").clone();
+
+        // Covisibility weight + spanning tree restored.
+        assert_eq!(ra.get_weight(&rb), 42);
+        assert_eq!(rb.get_parent().expect("parent restored").id, a.id);
+        assert!(ra.get_children().iter().any(|c| c.id == b.id));
+
+        // Origins, initial keyframe.
+        assert_eq!(rmap.get_key_frame_origins()[0].id, a.id);
+        assert_eq!(rmap.get_origin_kf().expect("origin kf").id, a.id);
+
+        // Map-point observation restored, pointing at restored keyframe `a`.
+        let rmp = rmap.get_all_map_points()[0].clone();
+        assert_eq!(rmp.id, mp.id);
+        let obs = rmp.get_observations();
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].0.id, a.id);
+
+        // Back-pointers re-point at the restored map (Weak upgrade).
+        assert_eq!(ra.get_map().expect("kf map").get_id(), rmap.get_id());
+        assert_eq!(rmp.get_map().expect("mp map").get_id(), rmap.get_id());
+
+        // Camera link + pose preserved.
+        assert_eq!(ra.camera.get_id(), cam.get_id());
+        let dt = (ra.get_pose().translation.vector - a.get_pose().translation.vector).norm();
+        assert!(dt < 1e-5, "pose drift {dt}");
     }
 }

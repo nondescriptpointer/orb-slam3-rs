@@ -37,8 +37,19 @@ use crate::imu_types::{Bias, Calib, Preintegrated};
 use crate::map::Map;
 use crate::map_point::MapPoint;
 use crate::orb_vocabulary::{BowVector, DESC_LEN, Descriptor, FeatureVector};
+use crate::serialization_utils::{SerializableKeyPoint, SerializableMat};
+use serde::{Deserialize, Serialize};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Current value of the global keyframe-id counter (for serialization).
+pub(crate) fn peek_next_id() -> u64 {
+    NEXT_ID.load(Ordering::SeqCst)
+}
+/// Restore the global keyframe-id counter (after deserialization).
+pub(crate) fn set_next_id(v: u64) {
+    NEXT_ID.store(v, Ordering::SeqCst);
+}
 
 /// Pose-group state
 struct PoseState {
@@ -808,6 +819,337 @@ impl KeyFrame {
             return None;
         }
         Some(Point2f::new(u, v))
+    }
+}
+
+/// Serde-friendly snapshot of a [`KeyFrame`].
+///
+/// Mirrors `KeyFrame::serialize` in ORB-SLAM3: all intrinsic / geometric data
+/// is stored inline, while every pointer (map points, covisibility graph,
+/// spanning tree, loop / merge edges, prev / next keyframe, cameras) is captured
+/// as ids and re-linked in [`KeyFrame::restore_links`]. Fields with no
+/// counterpart in this port (`mfScale`, `mTcp`, `mHalfBaseline`) are omitted.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct KeyFrameSnapshot {
+    imu: bool,
+    pub(crate) id: u64,
+    frame_id: usize,
+    timestamp: f64,
+    grid_cols: usize,
+    grid_rows: usize,
+    grid_element_width_inv: f32,
+    grid_element_height_inv: f32,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+    invfx: f32,
+    invfy: f32,
+    bf: f32,
+    b: f32,
+    th_depth: f32,
+    dist_coef: SerializableMat,
+    k_matrix: Matrix3<f32>,
+    n: usize,
+    keys: Vec<SerializableKeyPoint>,
+    keys_un: Vec<SerializableKeyPoint>,
+    keys_right: Option<Vec<SerializableKeyPoint>>,
+    u_right: Vec<f32>,
+    depth: Vec<f32>,
+    descriptors: SerializableMat,
+    bow_vec: BowVector,
+    feat_vec: FeatureVector,
+    scale_levels: usize,
+    scale_factor: f32,
+    log_scale_factor: f32,
+    scale_factors: Vec<f32>,
+    level_sigma2: Vec<f32>,
+    inv_level_sigma2: Vec<f32>,
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    grid: Vec<Vec<usize>>,
+    grid_right: Vec<Vec<usize>>,
+    left_to_right_match: Option<Vec<usize>>,
+    right_to_left_match: Option<Vec<usize>>,
+    imu_calib: Calib,
+    imu_preintegrated: Option<Preintegrated>,
+    origin_map_id: u32,
+    name_file: String,
+    dataset: u32,
+    pub(crate) camera_id: Option<u64>,
+    pub(crate) camera2_id: Option<u64>,
+    n_left: Option<usize>,
+    n_right: Option<usize>,
+    // Pose state
+    tcw: Isometry3<f32>,
+    tlr: Isometry3<f32>,
+    vw: Vector3<f32>,
+    owb: Vector3<f32>,
+    has_velocity: bool,
+    imu_bias: Bias,
+    // Pointer graph captured as ids
+    map_point_ids: Vec<Option<usize>>,
+    connected_weights: Vec<(u64, i32)>,
+    first_connection: bool,
+    parent_id: Option<u64>,
+    children_ids: Vec<u64>,
+    loop_edge_ids: Vec<u64>,
+    merge_edge_ids: Vec<u64>,
+    not_erase: bool,
+    to_be_erased: bool,
+    bad: bool,
+    prev_kf_id: Option<u64>,
+    next_kf_id: Option<u64>,
+}
+
+impl KeyFrame {
+    /// Capture this keyframe's serializable state (`KeyFrame::PreSave`).
+    pub(crate) fn to_snapshot(&self) -> KeyFrameSnapshot {
+        let pose = self.pose.read().unwrap();
+        let conn = self.conn.read().unwrap();
+        let map_point_ids = self
+            .map_points
+            .read()
+            .unwrap()
+            .iter()
+            .map(|slot| slot.as_ref().map(|mp| mp.id))
+            .collect();
+        KeyFrameSnapshot {
+            imu: self.imu,
+            id: self.id,
+            frame_id: self.frame_id,
+            timestamp: self.timestamp,
+            grid_cols: self.grid_cols,
+            grid_rows: self.grid_rows,
+            grid_element_width_inv: self.grid_element_width_inv,
+            grid_element_height_inv: self.grid_element_height_inv,
+            fx: self.fx,
+            fy: self.fy,
+            cx: self.cx,
+            cy: self.cy,
+            invfx: self.invfx,
+            invfy: self.invfy,
+            bf: self.bf,
+            b: self.b,
+            th_depth: self.th_depth,
+            dist_coef: SerializableMat::from_mat(&self.dist_coef).expect("serialize dist_coef"),
+            k_matrix: self.k_matrix,
+            n: self.n,
+            keys: SerializableKeyPoint::from_slice(&self.keys),
+            keys_un: SerializableKeyPoint::from_slice(&self.keys_un),
+            keys_right: self
+                .keys_right
+                .as_ref()
+                .map(|kr| SerializableKeyPoint::from_slice(kr)),
+            u_right: self.u_right.clone(),
+            depth: self.depth.clone(),
+            descriptors: SerializableMat::from_mat(&self.descriptors)
+                .expect("serialize descriptors"),
+            bow_vec: self.bow_vec.clone(),
+            feat_vec: self.feat_vec.clone(),
+            scale_levels: self.scale_levels,
+            scale_factor: self.scale_factor,
+            log_scale_factor: self.log_scale_factor,
+            scale_factors: self.scale_factors.clone(),
+            level_sigma2: self.level_sigma2.clone(),
+            inv_level_sigma2: self.inv_level_sigma2.clone(),
+            min_x: self.min_x,
+            min_y: self.min_y,
+            max_x: self.max_x,
+            max_y: self.max_y,
+            grid: self.grid.clone(),
+            grid_right: self.grid_right.clone(),
+            left_to_right_match: self.left_to_right_match.clone(),
+            right_to_left_match: self.right_to_left_match.clone(),
+            imu_calib: self.imu_calib.clone(),
+            imu_preintegrated: self.imu_preintegrated.as_deref().cloned(),
+            origin_map_id: self.origin_map_id,
+            name_file: self.name_file.clone(),
+            dataset: self.dataset,
+            camera_id: Some(self.camera.get_id()),
+            camera2_id: self.camera2.as_ref().map(|c| c.get_id()),
+            n_left: self.n_left,
+            n_right: self.n_right,
+            tcw: pose.tcw,
+            tlr: pose.tlr,
+            vw: pose.vw,
+            owb: pose.owb,
+            has_velocity: pose.has_velocity,
+            imu_bias: pose.imu_bias,
+            map_point_ids,
+            connected_weights: conn
+                .connected_weights
+                .iter()
+                .map(|(id, (_, w))| (*id, *w))
+                .collect(),
+            first_connection: conn.first_connection,
+            parent_id: conn.parent.as_ref().and_then(Weak::upgrade).map(|k| k.id),
+            children_ids: conn.children.keys().copied().collect(),
+            loop_edge_ids: conn.loop_edges.keys().copied().collect(),
+            merge_edge_ids: conn.merge_edges.keys().copied().collect(),
+            not_erase: conn.not_erase,
+            to_be_erased: conn.to_be_erased,
+            bad: conn.bad,
+            prev_kf_id: self.prev_kf.read().unwrap().upgrade().map(|k| k.id),
+            next_kf_id: self.next_kf.read().unwrap().upgrade().map(|k| k.id),
+        }
+    }
+
+    /// Build a link-less keyframe shell from a backup. The covisibility graph,
+    /// spanning tree, map-point matches and prev / next links are wired
+    /// separately in [`KeyFrame::restore_links`].
+    pub(crate) fn from_snapshot(
+        b: &KeyFrameSnapshot,
+        camera: Arc<dyn GeometricCamera>,
+        camera2: Option<Arc<dyn GeometricCamera>>,
+    ) -> Arc<KeyFrame> {
+        let kf = KeyFrame {
+            imu: b.imu,
+            id: b.id,
+            frame_id: b.frame_id,
+            timestamp: b.timestamp,
+            grid_cols: b.grid_cols,
+            grid_rows: b.grid_rows,
+            grid_element_width_inv: b.grid_element_width_inv,
+            grid_element_height_inv: b.grid_element_height_inv,
+            fx: b.fx,
+            fy: b.fy,
+            cx: b.cx,
+            cy: b.cy,
+            invfx: b.invfx,
+            invfy: b.invfy,
+            bf: b.bf,
+            b: b.b,
+            th_depth: b.th_depth,
+            dist_coef: b.dist_coef.to_mat().expect("deserialize dist_coef"),
+            k_matrix: b.k_matrix,
+            n: b.n,
+            keys: SerializableKeyPoint::to_vec(&b.keys).expect("deserialize keys"),
+            keys_un: SerializableKeyPoint::to_vec(&b.keys_un).expect("deserialize keys_un"),
+            keys_right: b
+                .keys_right
+                .as_ref()
+                .map(|kr| SerializableKeyPoint::to_vec(kr).expect("deserialize keys_right")),
+            u_right: b.u_right.clone(),
+            depth: b.depth.clone(),
+            descriptors: b.descriptors.to_mat().expect("deserialize descriptors"),
+            bow_vec: b.bow_vec.clone(),
+            feat_vec: b.feat_vec.clone(),
+            scale_levels: b.scale_levels,
+            scale_factor: b.scale_factor,
+            log_scale_factor: b.log_scale_factor,
+            scale_factors: b.scale_factors.clone(),
+            level_sigma2: b.level_sigma2.clone(),
+            inv_level_sigma2: b.inv_level_sigma2.clone(),
+            min_x: b.min_x,
+            min_y: b.min_y,
+            max_x: b.max_x,
+            max_y: b.max_y,
+            grid: b.grid.clone(),
+            grid_right: b.grid_right.clone(),
+            left_to_right_match: b.left_to_right_match.clone(),
+            right_to_left_match: b.right_to_left_match.clone(),
+            imu_calib: b.imu_calib.clone(),
+            imu_preintegrated: b.imu_preintegrated.clone().map(Arc::new),
+            origin_map_id: b.origin_map_id,
+            name_file: b.name_file.clone(),
+            dataset: b.dataset,
+            camera,
+            camera2,
+            n_left: b.n_left,
+            n_right: b.n_right,
+            pose: RwLock::new(PoseState {
+                tcw: Isometry3::identity(),
+                rcw: Matrix3::identity(),
+                twc: Isometry3::identity(),
+                rwc: Matrix3::identity(),
+                owb: Vector3::zeros(),
+                vw: b.vw,
+                has_velocity: b.has_velocity,
+                tlr: b.tlr,
+                trl: b.tlr.inverse(),
+                imu_bias: b.imu_bias,
+            }),
+            map_points: RwLock::new(vec![None; b.n]),
+            conn: RwLock::new(ConnState {
+                first_connection: b.first_connection,
+                not_erase: b.not_erase,
+                to_be_erased: b.to_be_erased,
+                bad: b.bad,
+                ..ConnState::default()
+            }),
+            map: RwLock::new(Weak::new()),
+            prev_kf: RwLock::new(Weak::new()),
+            next_kf: RwLock::new(Weak::new()),
+        };
+        let kf = Arc::new(kf);
+        kf.set_pose(b.tcw);
+        // `set_pose` recomputes `owb` from the pose; restore the stored value so
+        // round-trips are exact even when the IMU calibration is unset.
+        kf.pose.write().unwrap().owb = b.owb;
+        kf
+    }
+
+    /// Re-establish the pointer graph from ids (`KeyFrame::PostLoad`).
+    pub(crate) fn restore_links(
+        &self,
+        b: &KeyFrameSnapshot,
+        kfs: &HashMap<u64, Arc<KeyFrame>>,
+        mps: &HashMap<usize, Arc<MapPoint>>,
+    ) {
+        {
+            let mut slots = self.map_points.write().unwrap();
+            for (i, id) in b.map_point_ids.iter().enumerate() {
+                if let Some(id) = id
+                    && let Some(mp) = mps.get(id)
+                    && i < slots.len()
+                {
+                    slots[i] = Some(mp.clone());
+                }
+            }
+        }
+        {
+            let mut conn = self.conn.write().unwrap();
+            for (id, w) in &b.connected_weights {
+                if let Some(kf) = kfs.get(id) {
+                    conn.connected_weights.insert(*id, (Arc::downgrade(kf), *w));
+                }
+            }
+            if let Some(pid) = b.parent_id
+                && let Some(kf) = kfs.get(&pid)
+            {
+                conn.parent = Some(Arc::downgrade(kf));
+            }
+            for id in &b.children_ids {
+                if let Some(kf) = kfs.get(id) {
+                    conn.children.insert(*id, Arc::downgrade(kf));
+                }
+            }
+            for id in &b.loop_edge_ids {
+                if let Some(kf) = kfs.get(id) {
+                    conn.loop_edges.insert(*id, Arc::downgrade(kf));
+                }
+            }
+            for id in &b.merge_edge_ids {
+                if let Some(kf) = kfs.get(id) {
+                    conn.merge_edges.insert(*id, Arc::downgrade(kf));
+                }
+            }
+        }
+        if let Some(pid) = b.prev_kf_id
+            && let Some(kf) = kfs.get(&pid)
+        {
+            *self.prev_kf.write().unwrap() = Arc::downgrade(kf);
+        }
+        if let Some(nid) = b.next_kf_id
+            && let Some(kf) = kfs.get(&nid)
+        {
+            *self.next_kf.write().unwrap() = Arc::downgrade(kf);
+        }
+        // Rebuild the weight-ordered covisibility vector from the restored map.
+        self.update_best_covisibles();
     }
 }
 

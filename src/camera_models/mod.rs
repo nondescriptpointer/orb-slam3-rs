@@ -22,6 +22,15 @@ fn next_geometric_camera_id() -> u64 {
     NEXT_GEOMETRIC_CAMERA_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Current value of the global camera-id counter (for serialization).
+pub(crate) fn peek_next_camera_id() -> u64 {
+    NEXT_GEOMETRIC_CAMERA_ID.load(Ordering::Relaxed)
+}
+/// Restore the global camera-id counter (after deserialization).
+pub(crate) fn set_next_camera_id(v: u64) {
+    NEXT_GEOMETRIC_CAMERA_ID.store(v, Ordering::Relaxed);
+}
+
 // `Send + Sync` supertrait: cameras are shared across the Tracking /
 // LocalMapping / LoopClosing threads via `Arc<dyn GeometricCamera>`. The
 // implementors (`Pinhole`, `KannalaBrandt8`) embed a `TwoViewReconstruction`,
@@ -105,30 +114,30 @@ impl std::fmt::Debug for dyn GeometricCamera {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data")]
-pub enum GeometricCameraSerde {
+pub enum GeometricCameraSnapshot {
     Pinhole(pinhole::Pinhole),
     KannalaBrandt8(kannala_brandt8::KannalaBrandt8),
 }
-impl GeometricCameraSerde {
+impl GeometricCameraSnapshot {
     pub fn into_boxed(self) -> Box<dyn GeometricCamera> {
         match self {
-            GeometricCameraSerde::Pinhole(cam) => Box::new(cam),
-            GeometricCameraSerde::KannalaBrandt8(cam) => Box::new(cam),
+            GeometricCameraSnapshot::Pinhole(cam) => Box::new(cam),
+            GeometricCameraSnapshot::KannalaBrandt8(cam) => Box::new(cam),
         }
     }
 }
 
-impl TryFrom<&dyn GeometricCamera> for GeometricCameraSerde {
+impl TryFrom<&dyn GeometricCamera> for GeometricCameraSnapshot {
     type Error = &'static str;
     fn try_from(camera: &dyn GeometricCamera) -> Result<Self, Self::Error> {
         if let Some(cam) = camera.as_any().downcast_ref::<pinhole::Pinhole>() {
-            return Ok(GeometricCameraSerde::Pinhole(cam.clone()));
+            return Ok(GeometricCameraSnapshot::Pinhole(cam.clone()));
         }
         if let Some(cam) = camera
             .as_any()
             .downcast_ref::<kannala_brandt8::KannalaBrandt8>()
         {
-            return Ok(GeometricCameraSerde::KannalaBrandt8(cam.clone()));
+            return Ok(GeometricCameraSnapshot::KannalaBrandt8(cam.clone()));
         }
         Err("unknown GeometricCamera implementation")
     }

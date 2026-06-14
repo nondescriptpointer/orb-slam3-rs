@@ -1,5 +1,58 @@
-use opencv::core::{Mat, MatTraitConst, MatTraitConstManual, MatTraitManual};
+use opencv::core::{
+    KeyPoint, KeyPointTraitConst, Mat, MatTraitConst, MatTraitConstManual, MatTraitManual,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// Plain, serde-friendly mirror of an OpenCV [`KeyPoint`].
+///
+/// Used directly inside the snapshot structs (see `KeyFrameSnapshot`) rather than
+/// as a `#[serde(with = ...)]` adapter, so the backup layout is fully owned by
+/// serde-derivable types.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializableKeyPoint {
+    x: f32,
+    y: f32,
+    size: f32,
+    angle: f32,
+    response: f32,
+    octave: i32,
+    class_id: i32,
+}
+impl SerializableKeyPoint {
+    pub fn from_kp(kp: &KeyPoint) -> Self {
+        let pt = kp.pt();
+        Self {
+            x: pt.x,
+            y: pt.y,
+            size: kp.size(),
+            angle: kp.angle(),
+            response: kp.response(),
+            octave: kp.octave(),
+            class_id: kp.class_id(),
+        }
+    }
+    pub fn to_kp(&self) -> opencv::Result<KeyPoint> {
+        KeyPoint::new_coords(
+            self.x,
+            self.y,
+            self.size,
+            self.angle,
+            self.response,
+            self.octave,
+            self.class_id,
+        )
+    }
+
+    /// Convert a slice of OpenCV keypoints into serde-friendly mirrors.
+    pub fn from_slice(kps: &[KeyPoint]) -> Vec<Self> {
+        kps.iter().map(Self::from_kp).collect()
+    }
+
+    /// Rebuild a vector of OpenCV keypoints from their mirrors.
+    pub fn to_vec(items: &[Self]) -> opencv::Result<Vec<KeyPoint>> {
+        items.iter().map(Self::to_kp).collect()
+    }
+}
 
 /// Drop-in adapter for `#[serde(with = "mat_serde")]` on `Mat` fields.
 pub mod mat_serde {

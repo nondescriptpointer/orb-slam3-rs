@@ -3,9 +3,11 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::{
+    atlas::Atlas,
     key_frame_database::KeyFrameDatabase,
     orb_vocabulary::{OrbVocabulary, VocabularyError},
     settings::{Settings, SettingsError},
+    viewer::Viewer,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +22,8 @@ pub enum Sensor {
 
 pub struct System {
     sensor: Sensor,
-    // TODO: viewer
+    // TODO
+    viewer: Option<Arc<Viewer>>,
     reset: bool,
     reset_active_map: bool,
     activate_localization_mode: bool,
@@ -70,16 +73,20 @@ impl System {
         // Create keyframe database
         let keyframe_database = KeyFrameDatabase::new(vocabulary);
 
-        if let Some(load_path) = &settings.load_and_save.load_from {
-            // Load atlas
+        let atlas = if let Some(load_path) = &settings.load_and_save.load_from {
+            info!("Initialization of Atlas from file: {}", load_path);
+            // TODO: here
+            Atlas::new()
         } else {
-            // Create atlas
-        }
+            info!("Initialization of Atlas from scratch");
+            Atlas::from_kf_id(0)
+        };
 
         // TODO: here
 
         Ok(System {
             sensor,
+            viewer: None,
             reset: false,
             reset_active_map: false,
             activate_localization_mode: false,
@@ -90,4 +97,8 @@ impl System {
             save_atlas_file_path: settings.load_and_save.save_to.clone(),
         })
     }
+}
+
+fn load_atlas() -> Atlas {
+    Atlas::new()
 }

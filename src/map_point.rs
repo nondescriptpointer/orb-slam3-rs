@@ -22,10 +22,6 @@
 //! (`MapPoint → ref_kf → KeyFrame → map_points → MapPoint`) are stored as
 //! [`Weak`] references.
 
-// These types are not yet `Send + Sync` (opencv `KeyPoint` is `!Sync`); the
-// `Arc::new` lint is a deferred-threading fact (see the camera_models note).
-#![allow(clippy::arc_with_non_send_sync)]
-
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -643,7 +639,7 @@ impl Default for MapPoint {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::excessive_precision, clippy::arc_with_non_send_sync)]
+    #![allow(clippy::excessive_precision)]
     use std::sync::Arc;
 
     use nalgebra::Vector3;

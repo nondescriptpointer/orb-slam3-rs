@@ -1,6 +1,6 @@
 // Shared fixtures for the inline parity tests in `frame.rs`, `map_point.rs` and `key_frame.rs`.
 
-#![allow(clippy::excessive_precision, clippy::arc_with_non_send_sync)]
+#![allow(clippy::excessive_precision)]
 
 use std::sync::Arc;
 

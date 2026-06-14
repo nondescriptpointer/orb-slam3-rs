@@ -1910,7 +1910,7 @@ fn compute_stereo_fisheye_matches(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::excessive_precision, clippy::arc_with_non_send_sync)]
+    #![allow(clippy::excessive_precision)]
     use std::sync::Arc;
 
     use nalgebra::Vector3;

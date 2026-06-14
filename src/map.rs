@@ -23,11 +23,6 @@
 //! discipline as [`crate::map_point`]: snapshot the membership under the lock,
 //! release it, then call into the keyframes / map points.
 
-// `Arc<KeyFrame>` / `Arc<MapPoint>` are not yet `Send + Sync` (opencv
-// `KeyPoint` is `!Sync`); the lint is a deferred-threading fact (see the
-// camera_models note).
-#![allow(clippy::arc_with_non_send_sync)]
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};

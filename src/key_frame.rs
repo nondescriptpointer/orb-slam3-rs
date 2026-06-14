@@ -20,10 +20,8 @@
 //! and the test/Tracking code holding the keyframes.
 
 // `Arc<KeyFrame>`/`Arc<MapPoint>` hash by their stable `id`, so the `RwLock`
-// interior mutability is irrelevant to the hash; and (see the camera_models
-// note) these types are not yet `Send + Sync`. Both are deferred-threading
-// facts rather than real issues here.
-#![allow(clippy::mutable_key_type, clippy::arc_with_non_send_sync)]
+// interior mutability is irrelevant to the hash.
+#![allow(clippy::mutable_key_type)]
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -828,7 +826,7 @@ fn descriptors_to_array(descriptors: &Mat) -> Vec<Descriptor> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::excessive_precision, clippy::arc_with_non_send_sync)]
+    #![allow(clippy::excessive_precision)]
     use std::sync::Arc;
 
     use nalgebra::Vector3;

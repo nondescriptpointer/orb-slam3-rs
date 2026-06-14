@@ -2,7 +2,7 @@
 
 Rust reimplementation of [ORB-SLAM3](https://github.com/UZ-SLAMLab/ORB_SLAM3). The original C++ ORB-SLAM3 is currently unmaintained and hard to build on newer systems while still being the most used reference for realtime SLAM. This project aims to provide an easier way to run and integrate ORB-SLAM3 into your projects. It follows C++ codebase relatively closely while trying to be as Rust idiomatic as possible and does aim to introduce some improvements: fixes for various segfaults the C++ codebase is sensitive to, multithreading improvements, bugfixes based on pull requests and small performance improvements.
 
-This translation was largely not vibe coded except some automatic translation of long math-heavy classes and some of the unit tests to validate parity with the C++ codebase.
+This translation was largely not vibe coded except some automatic translation of long math-heavy classes, comments and some of the unit tests to validate parity with the C++ codebase.
 
 **Original authors:** Carlos Campos, Richard Elvira, Juan J. Gómez Rodríguez, [José M. M. Montiel](http://webdiis.unizar.es/~josemari/), [Juan D. Tardos](http://webdiis.unizar.es/~jdtardos/).
 
@@ -44,12 +44,12 @@ If you use ORB-SLAM3 in an academic work, please cite:
 
 # 2. Prerequisites
 
-Currently only tested on Linux. You just need a recent Rust compiler.
+Currently only tested on Linux. You just need a recent Rust compiler and OpenCV 4.x.
 
 # 3. Building ORB-SLAM3-RS library and examples
 
-Clone the repository:
-TBD
+Clone this repository:
+https://github.com/nondescriptpointer/orb-slam3-rs
 
 Build:
 cargo build

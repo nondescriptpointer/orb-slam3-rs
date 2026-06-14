@@ -91,7 +91,7 @@ impl System {
                 keyframe_database.clone(),
                 vocabulary.clone(),
             )
-            .expect("Error loading atlas file, please try with other session file or vocabulary")
+            .expect("Error loading Atlas file, please try with other session file or vocabulary")
         } else {
             info!("Initialization of Atlas from scratch");
             Atlas::from_kf_id(0)

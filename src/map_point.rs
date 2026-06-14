@@ -98,7 +98,9 @@ pub struct MapPoint {
     // Shared mutable state
     pos: RwLock<PosState>,
     feat: RwLock<FeatState>,
-    map: RwLock<Option<Arc<Map>>>,
+    // Weak back-pointer: the owning `Map` strongly holds this point, so a strong
+    // ref here would form an `Arc` cycle and leak the whole map.
+    map: RwLock<Weak<Map>>,
 }
 
 impl PartialEq for MapPoint {
@@ -164,7 +166,7 @@ impl MapPoint {
                 bad: false,
                 replaced: None,
             }),
-            map: RwLock::new(map),
+            map: RwLock::new(map.as_ref().map(Arc::downgrade).unwrap_or_default()),
         }
     }
 
@@ -392,7 +394,7 @@ impl MapPoint {
                 kf.erase_map_point_match_idx(right as usize);
             }
         }
-        if let Some(map) = self.map.read().unwrap().clone() {
+        if let Some(map) = self.map.read().unwrap().upgrade() {
             map.erase_map_point(self);
         }
     }
@@ -444,7 +446,7 @@ impl MapPoint {
         other.increase_visible(n_visible);
         other.compute_distinctive_descriptors();
 
-        if let Some(map) = self.map.read().unwrap().clone() {
+        if let Some(map) = self.map.read().unwrap().upgrade() {
             map.erase_map_point(self);
         }
     }
@@ -624,10 +626,10 @@ impl MapPoint {
     }
 
     pub fn get_map(&self) -> Option<Arc<Map>> {
-        self.map.read().unwrap().clone()
+        self.map.read().unwrap().upgrade()
     }
     pub fn update_map(&self, map: Arc<Map>) {
-        *self.map.write().unwrap() = Some(map);
+        *self.map.write().unwrap() = Arc::downgrade(&map);
     }
 }
 

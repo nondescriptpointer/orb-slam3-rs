@@ -154,7 +154,9 @@ pub struct KeyFrame {
     pose: RwLock<PoseState>,
     map_points: RwLock<Vec<Option<Arc<MapPoint>>>>,
     conn: RwLock<ConnState>,
-    map: RwLock<Option<Arc<Map>>>,
+    // Weak back-pointer: the owning `Map` strongly holds this keyframe, so a
+    // strong ref here would form an `Arc` cycle and leak the whole map.
+    map: RwLock<Weak<Map>>,
     prev_kf: RwLock<Weak<KeyFrame>>,
     next_kf: RwLock<Weak<KeyFrame>>,
 }
@@ -261,7 +263,7 @@ impl KeyFrame {
                 first_connection: true,
                 ..ConnState::default()
             }),
-            map: RwLock::new(Some(map)),
+            map: RwLock::new(Arc::downgrade(&map)),
             prev_kf: RwLock::new(Weak::new()),
             next_kf: RwLock::new(Weak::new()),
         };
@@ -648,10 +650,10 @@ impl KeyFrame {
     // --- Map ------------------------------------------------------------
 
     pub fn get_map(&self) -> Option<Arc<Map>> {
-        self.map.read().unwrap().clone()
+        self.map.read().unwrap().upgrade()
     }
     pub fn update_map(&self, map: Arc<Map>) {
-        *self.map.write().unwrap() = Some(map);
+        *self.map.write().unwrap() = Arc::downgrade(&map);
     }
 
     // --- Keypoint geometry ---------------------------------------------

@@ -308,16 +308,53 @@ impl Map {
         self.inner.write().unwrap().map_change_notified = current_change_id;
     }
 
-    pub fn pre_save(&mut self, cams: &Vec<Arc<dyn GeometricCamera>>) {
-        // TODO
+    /// Prepare the map for serialization.
+    ///
+    /// Ports the graph-maintenance half of ORB-SLAM3's `Map::PreSave`: every
+    /// observation that references a keyframe belonging to a *different* map (or
+    /// a bad keyframe) is dropped, so the saved map is self-contained.
+    ///
+    /// NOTE: the pointer→id backup conversion (`mvpBackupMapPoints`,
+    /// `mvpBackupKeyFrames`, `mnBackupKF*`, and the per-keyframe / per-point
+    /// `PreSave`) is deferred until the serde serialization layer exists.
+    pub fn pre_save(&self, _cams: &[Arc<dyn GeometricCamera>]) {
+        let this_id = self.get_id();
+        for mp in self.get_all_map_points() {
+            if mp.is_bad() {
+                continue;
+            }
+            for (kf, _) in mp.get_observations() {
+                let foreign = kf.get_map().map(|m| m.get_id()) != Some(this_id);
+                if foreign || kf.is_bad() {
+                    mp.erase_observation(&kf);
+                }
+            }
+        }
     }
 
+    /// Re-establish references after deserialization.
+    ///
+    /// Ports the back-pointer rewiring of ORB-SLAM3's `Map::PostLoad`
+    /// (`UpdateMap(this)`): each keyframe and map point is re-pointed at this
+    /// map. This is essential because the `map` back-pointers are [`Weak`] and
+    /// would be dangling on a freshly loaded graph.
+    ///
+    /// NOTE: wiring the ORB vocabulary / keyframe database into each keyframe,
+    /// re-adding keyframes to the database, and rebuilding
+    /// `kf_initial` / `kf_lower` / origins from their backup ids is deferred
+    /// until the serde serialization layer exists.
     pub fn post_load(
-        &mut self,
-        key_frame_database: Arc<KeyFrameDatabase>,
-        orb_voc: Arc<OrbVocabulary>,
+        self: &Arc<Self>,
+        _key_frame_database: Arc<KeyFrameDatabase>,
+        _orb_voc: Arc<OrbVocabulary>,
+        _cams: Arc<HashMap<u64, Arc<dyn GeometricCamera>>>,
     ) {
-        // TODO
+        for kf in self.get_all_key_frames() {
+            kf.update_map(self.clone());
+        }
+        for mp in self.get_all_map_points() {
+            mp.update_map(self.clone());
+        }
     }
 
     // IMU / inertial flags

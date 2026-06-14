@@ -1,5 +1,13 @@
+use md5::{Digest, Md5};
+use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::{
+    fs::File,
+    io::{self, Read},
+    path::Path,
+};
 use tracing::info;
 
 use crate::{
@@ -9,6 +17,7 @@ use crate::{
     settings::{Settings, SettingsError},
     viewer::Viewer,
 };
+use crate::{key_frame_database, orb_vocabulary};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sensor {
@@ -48,6 +57,7 @@ impl System {
         sensor: Sensor,
         use_viewer: bool,
     ) -> Result<Self, SystemError> {
+        info!("orb-slam3-rs");
         info!(
             "ORB-SLAM3 Copyright (C) 2017-2020 Carlos Campos, Richard Elvira, Juan J. Gómez, José M.M. Montiel and Juan D. Tardós, University of Zaragoza."
         );
@@ -71,12 +81,17 @@ impl System {
         info!("ORB vocabulary loaded!");
         let vocabulary = Arc::new(vocabulary);
         // Create keyframe database
-        let keyframe_database = KeyFrameDatabase::new(vocabulary);
+        let keyframe_database = Arc::new(KeyFrameDatabase::new(vocabulary.clone()));
 
         let atlas = if let Some(load_path) = &settings.load_and_save.load_from {
             info!("Initialization of Atlas from file: {}", load_path);
-            // TODO: here
-            Atlas::new()
+            load_atlas(
+                load_path,
+                vocabulary_path,
+                keyframe_database.clone(),
+                vocabulary.clone(),
+            )
+            .expect("Error loading atlas file, please try with other session file or vocabulary")
         } else {
             info!("Initialization of Atlas from scratch");
             Atlas::from_kf_id(0)
@@ -99,6 +114,68 @@ impl System {
     }
 }
 
-fn load_atlas() -> Atlas {
-    Atlas::new()
+#[derive(Debug)]
+pub enum AtlasLoadError {
+    Io(std::io::Error),
+    Postcard(postcard::Error),
+    IncompatibleVocabulary(String),
+}
+impl From<std::io::Error> for AtlasLoadError {
+    fn from(err: std::io::Error) -> Self {
+        AtlasLoadError::Io(err)
+    }
+}
+impl From<postcard::Error> for AtlasLoadError {
+    fn from(err: postcard::Error) -> Self {
+        AtlasLoadError::Postcard(err)
+    }
+}
+#[derive(Serialize, Deserialize)]
+struct SessionSnapshot {
+    file_voc: String,
+    file_voc_checksum: String,
+    atlas: Atlas,
+}
+
+fn load_atlas(
+    path: &str,
+    vocabulary_path: &PathBuf,
+    key_frame_database: Arc<KeyFrameDatabase>,
+    orb_vocabulary: Arc<OrbVocabulary>,
+) -> Result<Atlas, AtlasLoadError> {
+    let path_load_file_name = format!("./{}.postcard", path);
+    let bytes = fs::read(path_load_file_name)?;
+    let snapshot: SessionSnapshot = postcard::from_bytes(&bytes)?;
+
+    // Check if the vocabulary is compatible
+    let checksum = calculate_checksum(vocabulary_path)?;
+    if checksum != snapshot.file_voc_checksum {
+        return Err(AtlasLoadError::IncompatibleVocabulary(snapshot.file_voc));
+    }
+
+    let mut atlas = snapshot.atlas;
+    atlas.set_key_frame_database(key_frame_database);
+    atlas.set_orb_vocabulary(orb_vocabulary);
+    atlas.post_load();
+
+    Ok(atlas)
+}
+
+pub fn calculate_checksum(filename: impl AsRef<Path>) -> io::Result<String> {
+    let mut f = File::open(filename)?;
+    let mut hasher = Md5::new();
+    let mut buffer = [0u8; 1024];
+    loop {
+        let count = f.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let digest = hasher.finalize();
+    let checksum = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(checksum)
 }

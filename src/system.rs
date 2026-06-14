@@ -83,19 +83,30 @@ impl System {
         // Create keyframe database
         let keyframe_database = Arc::new(KeyFrameDatabase::new(vocabulary.clone()));
 
-        let atlas = if let Some(load_path) = &settings.load_and_save.load_from {
+        let mut atlas = if let Some(load_path) = &settings.load_and_save.load_from {
             info!("Initialization of Atlas from file: {}", load_path);
-            load_atlas(
+            let mut ret = load_atlas(
                 load_path,
                 vocabulary_path,
                 keyframe_database.clone(),
                 vocabulary.clone(),
             )
-            .expect("Error loading Atlas file, please try with other session file or vocabulary")
+            .expect("Error loading Atlas file, please try with other session file or vocabulary");
+            ret.create_new_map();
+            ret
         } else {
             info!("Initialization of Atlas from scratch");
             Atlas::from_kf_id(0)
         };
+
+        if matches!(
+            sensor,
+            Sensor::IMUStereo | Sensor::IMUMonocular | Sensor::IMURGBD
+        ) {
+            atlas.set_inertial_sensor();
+        }
+
+        // Create drawers for the viewer
 
         // TODO: here
 

@@ -8,6 +8,8 @@ pub mod geometric_tools;
 pub mod imu_types;
 pub mod key_frame;
 pub mod key_frame_database;
+pub mod local_mapping;
+pub mod loop_closing;
 pub mod map;
 pub mod map_point;
 pub mod orb_extractor;
@@ -18,6 +20,7 @@ pub mod settings;
 pub mod system;
 #[cfg(test)]
 mod test_helpers;
+pub mod tracking;
 pub mod two_view_reconstruction;
 pub mod viewer;
 

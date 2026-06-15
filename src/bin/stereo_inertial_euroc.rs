@@ -245,7 +245,10 @@ fn main() -> Result<(), RuntimeError> {
         &settings_path,
         orb_slam3_rs::system::Sensor::IMUStereo,
         true,
+        None,
     );
+
+    // TODO: here
 
     Ok(())
 }

@@ -21,5 +21,7 @@ flate2 = "1.0"
 tar = "0.4"
 
 [features]
-default = ['register-times']
+default = ['register-times','tracker-pause-resume','viewer']
 register-times = []
+tracker-pause-resume = []
+viewer = []

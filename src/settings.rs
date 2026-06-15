@@ -9,6 +9,7 @@ use opencv::{
     prelude::*,
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::info;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,9 +21,22 @@ pub enum CameraType {
 
 #[derive(Debug)]
 pub struct CameraInfo {
-    pub calibration: Box<dyn GeometricCamera>,
-    pub original_calibration: Box<dyn GeometricCamera>,
+    pub calibration: Arc<dyn GeometricCamera>,
+    pub original_calibration: Arc<dyn GeometricCamera>,
     pub pinhole_distortion: Option<Vec<f32>>,
+}
+
+impl CameraInfo {
+    /// Mutable access to the calibration during settings construction.
+    ///
+    /// The camera is shared as `Arc<dyn GeometricCamera>` everywhere downstream,
+    /// but while `Settings` is still being built the `Arc` is uniquely owned, so
+    /// `Arc::get_mut` is guaranteed to succeed. Calibration is logically
+    /// immutable once parsing finishes.
+    fn calibration_mut(&mut self) -> &mut dyn GeometricCamera {
+        Arc::get_mut(&mut self.calibration)
+            .expect("camera Arc is unique during settings construction")
+    }
 }
 
 #[derive(Debug)]
@@ -362,26 +376,22 @@ impl Settings {
 
             // Update calibration
             let cam1 = camera1.as_mut().unwrap();
-            cam1.calibration.set_parameter(
-                *p1.at_2d::<f64>(0, 0)
-                    .map_err(|_| SettingsError::Rectification)? as f32,
-                0,
-            );
-            cam1.calibration.set_parameter(
-                *p1.at_2d::<f64>(1, 1)
-                    .map_err(|_| SettingsError::Rectification)? as f32,
-                1,
-            );
-            cam1.calibration.set_parameter(
-                *p1.at_2d::<f64>(0, 2)
-                    .map_err(|_| SettingsError::Rectification)? as f32,
-                2,
-            );
-            cam1.calibration.set_parameter(
-                *p1.at_2d::<f64>(1, 2)
-                    .map_err(|_| SettingsError::Rectification)? as f32,
-                3,
-            );
+            let fx = *p1
+                .at_2d::<f64>(0, 0)
+                .map_err(|_| SettingsError::Rectification)? as f32;
+            let fy = *p1
+                .at_2d::<f64>(1, 1)
+                .map_err(|_| SettingsError::Rectification)? as f32;
+            let cx = *p1
+                .at_2d::<f64>(0, 2)
+                .map_err(|_| SettingsError::Rectification)? as f32;
+            let cy = *p1
+                .at_2d::<f64>(1, 2)
+                .map_err(|_| SettingsError::Rectification)? as f32;
+            cam1.calibration_mut().set_parameter(fx, 0);
+            cam1.calibration_mut().set_parameter(fy, 1);
+            cam1.calibration_mut().set_parameter(cx, 2);
+            cam1.calibration_mut().set_parameter(cy, 3);
 
             // Update bf
             let b = read_param_float(&settings, "Stereo.b").unwrap_or(0.0);
@@ -451,6 +461,27 @@ impl Settings {
         })
     }
 
+    /// Distortion coefficients of the first camera as an N×1 `CV_32F` `Mat`.
+    /// Returns an empty `Mat` when the camera is undistorted (e.g. fisheye or rectified).
+    pub fn camera1_distortion_coef(&self) -> Mat {
+        Self::distortion_coef(self.camera1.as_ref())
+    }
+    /// Distortion coefficients of the second camera as an N×1 `CV_32F` `Mat`.
+    pub fn camera2_distortion_coef(&self) -> Mat {
+        Self::distortion_coef(self.camera2.as_ref())
+    }
+    fn distortion_coef(camera: Option<&CameraInfo>) -> Mat {
+        match camera.and_then(|c| c.pinhole_distortion.as_ref()) {
+            Some(d) if !d.is_empty() => Mat::from_slice(d.as_slice())
+                .expect("from_slice on owned f32 distortion vector cannot fail")
+                .reshape(1, d.len() as i32)
+                .expect("reshape to N×1 of matching length cannot fail")
+                .try_clone()
+                .expect("clone of small distortion Mat cannot fail"),
+            _ => Mat::default(),
+        }
+    }
+
     fn read_camera(
         index: u8,
         storage: &FileStorage,
@@ -491,8 +522,8 @@ impl Settings {
                 }
 
                 CameraInfo {
-                    calibration: Box::new(cam),
-                    original_calibration: Box::new(original),
+                    calibration: Arc::new(cam),
+                    original_calibration: Arc::new(original),
                     pinhole_distortion: distortion,
                 }
             }
@@ -503,8 +534,8 @@ impl Settings {
 
                 // Rectified images are assumed to be ideal PinHole images (no distortion)
                 CameraInfo {
-                    calibration: Box::new(cam),
-                    original_calibration: Box::new(original),
+                    calibration: Arc::new(cam),
+                    original_calibration: Arc::new(original),
                     pinhole_distortion: None,
                 }
             }
@@ -539,8 +570,8 @@ impl Settings {
                 }
 
                 CameraInfo {
-                    calibration: Box::new(cam),
-                    original_calibration: Box::new(original),
+                    calibration: Arc::new(cam),
+                    original_calibration: Arc::new(original),
                     pinhole_distortion: None,
                 }
             }
@@ -572,20 +603,16 @@ impl Settings {
                 // Update calibration
                 let scale_factor = new_size.height as f32 / original_size.height as f32;
                 if let Some(camera) = camera1 {
-                    camera
-                        .calibration
-                        .set_parameter(camera.calibration.get_parameter(1) * scale_factor, 1);
-                    camera
-                        .calibration
-                        .set_parameter(camera.calibration.get_parameter(3) * scale_factor, 3);
+                    let p1 = camera.calibration.get_parameter(1) * scale_factor;
+                    let p3 = camera.calibration.get_parameter(3) * scale_factor;
+                    camera.calibration_mut().set_parameter(p1, 1);
+                    camera.calibration_mut().set_parameter(p3, 3);
                 }
                 if let Some(camera) = camera2 {
-                    camera
-                        .calibration
-                        .set_parameter(camera.calibration.get_parameter(1) * scale_factor, 1);
-                    camera
-                        .calibration
-                        .set_parameter(camera.calibration.get_parameter(3) * scale_factor, 3);
+                    let p1 = camera.calibration.get_parameter(1) * scale_factor;
+                    let p3 = camera.calibration.get_parameter(3) * scale_factor;
+                    camera.calibration_mut().set_parameter(p1, 1);
+                    camera.calibration_mut().set_parameter(p3, 3);
                 }
             }
         }
@@ -598,15 +625,13 @@ impl Settings {
                 // update calibration
                 let scale_factor = new_size.width as f32 / original_size.width as f32;
                 if let Some(camera) = camera1 {
-                    camera
-                        .calibration
-                        .set_parameter(camera.calibration.get_parameter(0) * scale_factor, 0);
-                    camera
-                        .calibration
-                        .set_parameter(camera.calibration.get_parameter(2) * scale_factor, 2);
+                    let p0 = camera.calibration.get_parameter(0) * scale_factor;
+                    let p2 = camera.calibration.get_parameter(2) * scale_factor;
+                    camera.calibration_mut().set_parameter(p0, 0);
+                    camera.calibration_mut().set_parameter(p2, 2);
                     if *camera_type == CameraType::KannalaBrandt {
                         if let Some(kanalla) = camera
-                            .calibration
+                            .calibration_mut()
                             .as_any_mut()
                             .downcast_mut::<KannalaBrandt8>()
                         {
@@ -618,15 +643,13 @@ impl Settings {
                     }
                 }
                 if let Some(camera) = camera2 {
-                    camera
-                        .calibration
-                        .set_parameter(camera.calibration.get_parameter(0) * scale_factor, 0);
-                    camera
-                        .calibration
-                        .set_parameter(camera.calibration.get_parameter(2) * scale_factor, 2);
+                    let p0 = camera.calibration.get_parameter(0) * scale_factor;
+                    let p2 = camera.calibration.get_parameter(2) * scale_factor;
+                    camera.calibration_mut().set_parameter(p0, 0);
+                    camera.calibration_mut().set_parameter(p2, 2);
                     if *camera_type == CameraType::KannalaBrandt {
                         if let Some(kanalla) = camera
-                            .calibration
+                            .calibration_mut()
                             .as_any_mut()
                             .downcast_mut::<KannalaBrandt8>()
                         {

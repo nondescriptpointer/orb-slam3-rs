@@ -32,6 +32,7 @@ pub enum Sensor {
 pub struct System {
     sensor: Sensor,
     // TODO
+    #[cfg(feature = "viewer")]
     viewer: Option<Arc<Viewer>>,
     reset: bool,
     reset_active_map: bool,
@@ -56,6 +57,7 @@ impl System {
         settings_path: &PathBuf,
         sensor: Sensor,
         use_viewer: bool,
+        sequence: Option<String>,
     ) -> Result<Self, SystemError> {
         info!("orb-slam3-rs");
         info!(
@@ -107,8 +109,18 @@ impl System {
         }
 
         // Create drawers for the viewer
+        #[cfg(feature = "viewer")]
+        if use_viewer {
+            // TODO: implement this later, viewer stuff is optional
+        }
 
-        // TODO: here
+        if let Some(sequence) = sequence {
+            info!("Seq. Name: {}", sequence);
+        }
+
+        // Initialize the tracking thread
+        // It will live in the main thread of execution, the one that called this constructor
+        //
 
         Ok(System {
             sensor,

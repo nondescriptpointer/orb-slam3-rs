@@ -71,6 +71,8 @@ pub struct StereoInfo {
     pub tlr: Isometry3<f32>,
     pub b: f32,
     pub bf: f32,
+    // Raw depth the close/far threshold is `b * th_depth`, computed where it is consumed.
+    pub th_depth: f32,
     pub m1l: Mat,
     pub m2l: Mat,
     pub m1r: Mat,
@@ -84,6 +86,7 @@ impl std::fmt::Debug for StereoInfo {
             .field("tlr", &self.tlr)
             .field("b", &self.b)
             .field("bf", &self.bf)
+            .field("th_depth", &self.th_depth)
             .finish_non_exhaustive()
     }
 }
@@ -261,6 +264,7 @@ impl Settings {
                 tlr: Isometry3::identity(),
                 b,
                 bf: b * fx,
+                th_depth: read_param_float(&settings, "Stereo.ThDepth").unwrap_or(0.0),
                 m1l: Mat::default(),
                 m2l: Mat::default(),
                 m1r: Mat::default(),
@@ -434,6 +438,7 @@ impl Settings {
                 tlr,
                 b,
                 bf,
+                th_depth: read_param_float(&settings, "Stereo.ThDepth").unwrap_or(0.0),
                 m1l,
                 m2l,
                 m1r,

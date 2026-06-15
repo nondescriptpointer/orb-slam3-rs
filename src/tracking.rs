@@ -111,8 +111,8 @@ pub struct Tracking {
 
     // ORB
     orb_extractor_left: Arc<OrbExtractor>,
-    orb_extractor_right: Arc<OrbExtractor>,
-    ini_orb_extractor: Arc<OrbExtractor>,
+    orb_extractor_right: Option<Arc<OrbExtractor>>,
+    ini_orb_extractor: Option<Arc<OrbExtractor>>,
 
     // BoW
     orb_vocabulary: Arc<OrbVocabulary>,
@@ -142,7 +142,7 @@ pub struct Tracking {
     k: Mat,
     k_n: Matrix3<f32>,
     dist_coef: Mat,
-    bf: f32,
+    bf: Option<f32>,
     image_scale: f32,
 
     imu_freq: f32,
@@ -150,8 +150,8 @@ pub struct Tracking {
     insert_kfs_lost: bool,
 
     // New KeyFrame rules (according to fps)
-    min_frames: u32,
-    max_frames: u32,
+    min_frames: i32,
+    max_frames: i32,
 
     first_imu_frame_id: u32,
     frames_to_reset_imu: u64,
@@ -159,10 +159,10 @@ pub struct Tracking {
     // Threshold close/far points
     // Points seen as close by the stereo/RGBD sensor are considered reliable
     // and inserted from just one frame. Far points require a match in two keyframes
-    th_depth: f32,
+    th_depth: Option<f32>,
 
     // For RGB-D inputs only. For some datasets (eg TUM) the depthmap values are scaled
-    depth_map_factor: f32,
+    depth_map_factor: Option<f32>,
 
     // Current matches in frame
     matches_inliers: usize,
@@ -264,6 +264,7 @@ impl Tracking {
             {
                 let ret = settings.camera2.as_ref().unwrap().calibration.clone();
                 let ret = atlas.add_camera(ret);
+                // TODO: viewer: set frame drawer to stereo
                 (
                     Some(ret),
                     Some(settings.stereo.expect("missing stereo info").tlr),
@@ -271,6 +272,71 @@ impl Tracking {
             } else {
                 (None, None)
             };
+
+        // Sensor dependant settings
+        let (bf, th_depth, depth_map_factor) = match sensor {
+            Sensor::Stereo | Sensor::IMUStereo => {
+                let s = settings.stereo.as_ref().expect("missing stereo info");
+                (Some(s.bf), Some(s.b * s.th_depth), None)
+            }
+            Sensor::RGBD | Sensor::IMURGBD => {
+                let r = settings.rgbd.as_ref().expect("missing rgbd info");
+                let mut factor = r.depth_map_factor;
+                if factor.abs() < 1e-5 {
+                    factor = 1.
+                } else {
+                    factor = 1. / factor;
+                }
+                (Some(r.bf), Some(r.b * r.th_depth), Some(factor))
+            }
+            _ => (None, None, None),
+        };
+
+        let max_frames = settings.image.fps;
+        let rgb = settings.image.rgb;
+
+        // ORB parameters
+        let orb = &settings.orb;
+        let n_features = orb.n_features;
+        let n_levels = orb.n_levels;
+        let ini_th_fast = orb.init_th_fast;
+        let min_th_fast = orb.min_th_fast;
+        let scale_factor = orb.scale_factor;
+        let orb_extractor_left = Arc::new(OrbExtractor::new(
+            orb.n_features as usize,
+            orb.scale_factor,
+            orb.n_levels as usize,
+            orb.init_th_fast,
+            orb.min_th_fast,
+        ));
+        let orb_extractor_right = if matches!(sensor, Sensor::Stereo | Sensor::IMUStereo) {
+            Some(Arc::new(OrbExtractor::new(
+                orb.n_features as usize,
+                orb.scale_factor,
+                orb.n_levels as usize,
+                orb.init_th_fast,
+                orb.min_th_fast,
+            )))
+        } else {
+            None
+        };
+        let ini_orb_extractor = if matches!(sensor, Sensor::Monocular | Sensor::IMUMonocular) {
+            Some(Arc::new(OrbExtractor::new(
+                orb.n_features as usize,
+                orb.scale_factor,
+                orb.n_levels as usize,
+                orb.init_th_fast,
+                orb.min_th_fast,
+            )))
+        } else {
+            None
+        };
+
+        // IMU parameters
+        // TODO
+
+        // Log camera info
+        // TODO
 
         Tracking {
             state: TrackingState::NoImagesYet,
@@ -304,6 +370,15 @@ impl Tracking {
             image_scale: 1.,
             k,
             k_n,
+            bf,
+            th_depth,
+            depth_map_factor,
+            min_frames: 0,
+            max_frames,
+            rgb,
+            orb_extractor_left,
+            orb_extractor_right,
+            ini_orb_extractor,
             #[cfg(feature = "register-times")]
             rect_stereo_ms: Vec::new(),
             #[cfg(feature = "register-times")]

@@ -394,7 +394,8 @@ impl Tracking {
             depth_map_factor,
             min_frames: 0,
             max_frames,
-            // there is a bug in the C++ code where this only applies for the legacy config loading, so this might not be correct
+            // there is a bug in the C++ code where this only applies for the legacy config loadin
+            // TODO: evaluate whether this should be set to max_frames or 0
             frames_to_reset_imu: max_frames as u64,
             rgb,
             orb_extractor_left,

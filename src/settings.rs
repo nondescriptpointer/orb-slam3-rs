@@ -53,7 +53,7 @@ pub struct IMUInfo {
     pub noise_gyro: f32,
     pub noise_acc: f32,
     pub gyro_walk: f32,
-    pub gyro_acc: f32,
+    pub acc_walk: f32,
     pub imu_frequency: f32,
     pub tbc: Isometry3<f32>,
     pub insert_kfs_when_lost: bool,
@@ -694,7 +694,7 @@ impl Settings {
             noise_gyro: read_param_float(storage, "IMU.NoiseGyro").unwrap_or(1.7e-04),
             noise_acc: read_param_float(storage, "IMU.NoiseAcc").unwrap_or(2.0e-03),
             gyro_walk: read_param_float(storage, "IMU.GyroWalk").unwrap_or(1.9393e-05),
-            gyro_acc: read_param_float(storage, "IMU.AccWalk").unwrap_or(3.0e-03),
+            acc_walk: read_param_float(storage, "IMU.AccWalk").unwrap_or(3.0e-03),
             imu_frequency: read_param_float(storage, "IMU.Frequency").unwrap_or(200.0),
             tbc: tbc,
             insert_kfs_when_lost: read_param_bool(storage, "IMU.InsertKFsWhenLost").unwrap_or(true),
@@ -1228,7 +1228,7 @@ mod tests {
         assert!(approx(imu.noise_acc, 0.002));
         assert!(approx(imu.gyro_walk, 1.9e-5));
         // NOTE: stored as `gyro_acc` in IMUInfo (historical typo for AccWalk).
-        assert!(approx(imu.gyro_acc, 3.0e-3));
+        assert!(approx(imu.acc_walk, 3.0e-3));
         assert!(approx(imu.imu_frequency, 200.0));
 
         assert!(approx(imu.tbc.translation.vector.x, 0.05));

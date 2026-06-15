@@ -17,26 +17,27 @@ use nalgebra::{Isometry3, Matrix3};
 use opencv::core::{CV_32F, Mat, MatExprTraitConst, Point2f, Point3f, Scalar};
 use opencv::prelude::*;
 use std::{fs::File, fs::OpenOptions, io::BufWriter, sync::Arc};
+use tracing::info;
 
 pub struct Tracking {
     pub state: TrackingState,
-    pub last_processed_state: TrackingState,
+    pub last_processed_state: Option<TrackingState>,
 
     // Input sensor
     pub sensor: Sensor,
 
     // Current frame
-    pub current_frame: Frame,
-    pub last_frame: Frame,
+    pub current_frame: Option<Frame>,
+    pub last_frame: Option<Frame>,
 
-    pub im_gray: Mat,
+    pub im_gray: Option<Mat>,
+    pub im_right: Option<Mat>,
 
     // Initialization variables (Monocular)
-    pub ini_last_matches: Vec<usize>,
     pub ini_matches: Vec<usize>,
     pub prev_matched: Vec<Point2f>,
     pub ini_p3d: Vec<Point3f>,
-    pub initial_frame: Frame,
+    pub initial_frame: Option<Frame>,
 
     // Lists used to recover the full camera trajectory at the end of the execution.
     // Basically we store the reference keyframe for each frame and its relative transformation
@@ -52,14 +53,11 @@ pub struct Tracking {
     // True if local mapping is deactivated and we are performing only localization
     pub only_tracking: bool,
 
-    pub mean_track: f32,
     pub init_with_3kfs: bool,
     pub t0: f64,    // timestamp of first read frame
     pub t0vis: f64, // timestamp of first inserted keyframe
     pub t0imu: f64, // timestamp of IMU initialization
     pub fast_init: bool,
-
-    pub write_stats: bool,
 
     #[cfg(feature = "register-times")]
     pub rect_stereo_ms: Vec<f64>,
@@ -80,12 +78,10 @@ pub struct Tracking {
     #[cfg(feature = "register-times")]
     pub track_total_ms: Vec<f64>,
 
-    pub im_right: Option<Mat>,
-
     map_updated: bool,
 
     // IMU preintegration from last frame
-    imu_preintegrated_from_last_kf: Arc<Preintegrated>,
+    imu_preintegrated_from_last_kf: Option<Arc<Preintegrated>>,
 
     // Queue of IMU measurements between frames
     queue_imu_data: Vec<Point>,
@@ -94,10 +90,10 @@ pub struct Tracking {
     imu_from_last_frame: Vec<Point>,
 
     // IMU calibration parameters
-    imu_calib: Vec<Arc<Calib>>,
+    imu_calib: Option<Arc<Calib>>,
 
     // Last Bias estimation (at keyframe creation)
-    last_bias: Bias,
+    last_bias: Option<Bias>,
 
     // In case of performing only localization, this flag is true when there are no matches to
     // points in the map. Still tracking will continue if there are enough matches with temporal points.
@@ -106,8 +102,8 @@ pub struct Tracking {
     visual_odometry: bool,
 
     // Other thread pointers
-    local_mapper: Arc<LocalMapping>,
-    loop_closing: Arc<LoopClosing>,
+    local_mapper: Option<Arc<LocalMapping>>,
+    loop_closing: Option<Arc<LoopClosing>>,
 
     // ORB
     orb_extractor_left: Arc<OrbExtractor>,
@@ -120,10 +116,9 @@ pub struct Tracking {
 
     // Initialization (only for monocular)
     ready_to_initialize: bool,
-    set_init: bool,
 
     // Local map
-    reference_kf: Arc<KeyFrame>,
+    reference_kf: Option<Arc<KeyFrame>>,
     local_key_frames: Vec<Arc<KeyFrame>>,
     local_map_points: Vec<Arc<KeyFrame>>,
 
@@ -153,7 +148,7 @@ pub struct Tracking {
     min_frames: i32,
     max_frames: i32,
 
-    first_imu_frame_id: u32,
+    first_imu_frame_id: Option<usize>,
     frames_to_reset_imu: u64,
 
     // Threshold close/far points
@@ -165,18 +160,18 @@ pub struct Tracking {
     depth_map_factor: Option<f32>,
 
     // Current matches in frame
-    matches_inliers: usize,
+    matches_inliers: Option<usize>,
 
     // Last Frame, KeyFrame and Relocalisation info
     last_key_frame: Option<Arc<KeyFrame>>,
-    last_key_frame_id: usize,
+    last_key_frame_id: Option<usize>,
     last_reloc_frame_id: usize,
-    timestamp_lost: f64,
+    timestamp_lost: Option<f64>,
     timestamp_recently_lost: f64,
 
     first_frame_id: usize,
     initial_frame_id: usize,
-    last_init_frame_id: usize,
+    last_init_frame_id: Option<usize>,
 
     created_map: bool,
 
@@ -189,9 +184,6 @@ pub struct Tracking {
     temporal_points: Vec<Arc<MapPoint>>,
 
     num_dataset: usize,
-
-    f_track_stats: BufWriter<File>,
-    f_track_times: BufWriter<File>,
 
     time_pre_int_imu: f64,
     time_pose_pred: f64,
@@ -206,8 +198,8 @@ pub struct Tracking {
 
     #[cfg(feature = "tracker-pause-resume")]
     stopped: bool,
+    #[cfg(feature = "tracker-pause-resume")]
     stop_requested: bool,
-    not_stop: bool,
 
     tlr: Option<Isometry3<f32>>,
 }
@@ -251,7 +243,7 @@ impl Tracking {
         let fy = camera.get_parameter(1);
         let cx = camera.get_parameter(2);
         let cy = camera.get_parameter(3);
-        let k = Mat::eye(3, 3, CV_32F).unwrap().to_mat().unwrap();
+        let mut k = Mat::eye(3, 3, CV_32F).unwrap().to_mat().unwrap();
         *k.at_2d_mut::<f32>(0, 0).unwrap() = fx;
         *k.at_2d_mut::<f32>(1, 1).unwrap() = fy;
         *k.at_2d_mut::<f32>(0, 2).unwrap() = cx;
@@ -267,7 +259,7 @@ impl Tracking {
                 // TODO: viewer: set frame drawer to stereo
                 (
                     Some(ret),
-                    Some(settings.stereo.expect("missing stereo info").tlr),
+                    Some(settings.stereo.as_ref().expect("missing stereo info").tlr),
                 )
             } else {
                 (None, None)
@@ -333,13 +325,41 @@ impl Tracking {
         };
 
         // IMU parameters
-        // TODO
+        let (insert_kfs_lost, imu_freq, imu_per, imu_calib, imu_preintegrated_from_last_kf) =
+            if let Some(imu) = settings.imu.as_ref() {
+                let tbc = &imu.tbc;
+                let sf = imu.imu_frequency.sqrt();
+                let calib = Arc::new(Calib::from_params(
+                    *tbc,
+                    imu.noise_gyro * sf,
+                    imu.noise_acc * sf,
+                    imu.gyro_walk * sf,
+                    imu.acc_walk * sf,
+                ));
+                (
+                    imu.insert_kfs_when_lost,
+                    imu.imu_frequency,
+                    0.001, // Original C++ codebase comment: 1.0 / (double) mImuFreq; Is this OK?
+                    Some(calib.clone()),
+                    Some(Arc::new(Preintegrated::from_bias_and_calib(
+                        &Bias::empty(),
+                        &calib,
+                    ))),
+                )
+            } else {
+                (false, 0., 0., None, None)
+            };
 
         // Log camera info
-        // TODO
+        let cameras = atlas.get_all_cameras();
+        info!("There are {} cameras in the atlas", cameras.len());
+        for cam in cameras {
+            info!("Camera {} is {:?}", cam.get_id(), cam.get_type());
+        }
 
         Tracking {
             state: TrackingState::NoImagesYet,
+            last_processed_state: None,
             sensor,
             tracked_fr: 0,
             step: false,
@@ -375,10 +395,56 @@ impl Tracking {
             depth_map_factor,
             min_frames: 0,
             max_frames,
+            // there is a bug in the C++ code where this only applies for the legacy config loading, so this might not be correct
+            frames_to_reset_imu: max_frames as u64,
             rgb,
             orb_extractor_left,
             orb_extractor_right,
             ini_orb_extractor,
+            insert_kfs_lost,
+            imu_freq,
+            imu_per,
+            imu_calib,
+            imu_preintegrated_from_last_kf,
+            current_frame: None,
+            last_frame: None,
+            fast_init: false,
+            first_imu_frame_id: None,
+            frame_times: Vec::new(),
+            im_gray: None,
+            im_right: None,
+            imu_from_last_frame: Vec::new(),
+            ini_matches: Vec::new(),
+            prev_matched: Vec::new(),
+            ini_p3d: Vec::new(),
+            initial_frame: None,
+            last_bias: None,
+            last_init_frame_id: None,
+            last_key_frame_id: None,
+            local_key_frames: Vec::new(),
+            local_map_points: Vec::new(),
+            local_mapper: None,
+            loop_closing: None,
+            lost: Vec::new(),
+            matches_inliers: None,
+            #[cfg(feature = "tracker-pause-resume")]
+            stopped: false,
+            #[cfg(feature = "tracker-pause-resume")]
+            stop_requested: false,
+            queue_imu_data: Vec::new(),
+            reference_kf: None,
+            references: Vec::new(),
+            relative_frame_poses: Vec::new(),
+            t0: 0.,
+            t0vis: 0.,
+            t0imu: 0.,
+            temporal_points: Vec::new(),
+            time_local_map_track: 0.,
+            time_new_kf_dec: 0.,
+            time_pose_pred: 0.,
+            time_pre_int_imu: 0.,
+            timestamp_lost: None,
+            velocity: None,
             #[cfg(feature = "register-times")]
             rect_stereo_ms: Vec::new(),
             #[cfg(feature = "register-times")]

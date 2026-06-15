@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tracing::info;
@@ -28,13 +32,14 @@ struct AtlasSnapshot {
 
 impl Serialize for Atlas {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let maps = self
+        let inner = self.inner.lock().unwrap();
+        let maps = inner
             .maps
             .values()
             .filter(|m| !m.is_bad())
             .map(|m| m.to_snapshot())
             .collect();
-        let cameras = self
+        let cameras = inner
             .cameras
             .iter()
             .filter_map(|c| GeometricCameraSnapshot::try_from(c.as_ref()).ok())
@@ -42,7 +47,7 @@ impl Serialize for Atlas {
         AtlasSnapshot {
             maps,
             cameras,
-            last_init_kf_id_map: self.last_init_kf_id_map,
+            last_init_kf_id_map: inner.last_init_kf_id_map,
             next_map_id: crate::map::peek_next_map_id(),
             next_frame_id: crate::frame::peek_next_frame_id(),
             next_key_frame_id: crate::key_frame::peek_next_id(),
@@ -80,14 +85,16 @@ impl<'de> Deserialize<'de> for Atlas {
         }
 
         Ok(Atlas {
-            maps,
-            bad_maps: HashMap::new(),
-            current_map: None,
-            cameras,
-            last_init_kf_id_map: snapshot.last_init_kf_id_map,
-            viewer: None,
-            key_frame_database: None,
-            orb_vocabulary: None,
+            inner: Mutex::new(AtlasInner {
+                maps,
+                bad_maps: HashMap::new(),
+                current_map: None,
+                cameras,
+                last_init_kf_id_map: snapshot.last_init_kf_id_map,
+                viewer: None,
+                key_frame_database: None,
+                orb_vocabulary: None,
+            }),
         })
     }
 }
@@ -130,6 +137,15 @@ impl std::fmt::Display for AtlasIoError {
 impl std::error::Error for AtlasIoError {}
 
 pub struct Atlas {
+    /// All mutable atlas state lives behind a single mutex
+    /// This lets the atlas be shared as `Arc<Atlas>` across the
+    /// tracking / local-mapping / loop-closing threads while every method takes
+    /// `&self`. Critical sections are intentionally short: the heavy lifting
+    /// happens inside `Map`, which carries its own interior locks.
+    inner: Mutex<AtlasInner>,
+}
+
+struct AtlasInner {
     maps: HashMap<u32, Arc<Map>>,
 
     bad_maps: HashMap<u32, Arc<Map>>,
@@ -147,15 +163,9 @@ pub struct Atlas {
     orb_vocabulary: Option<Arc<OrbVocabulary>>,
 }
 
-impl Default for Atlas {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Atlas {
-    pub fn new() -> Self {
-        Atlas {
+impl AtlasInner {
+    fn new() -> Self {
+        AtlasInner {
             maps: HashMap::new(),
             bad_maps: HashMap::new(),
             current_map: None,
@@ -166,21 +176,44 @@ impl Atlas {
             orb_vocabulary: None,
         }
     }
+}
+
+impl Default for Atlas {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Atlas {
+    pub fn new() -> Self {
+        Atlas {
+            inner: Mutex::new(AtlasInner::new()),
+        }
+    }
 
     pub fn from_kf_id(id: u64) -> Self {
-        let mut r = Atlas {
-            last_init_kf_id_map: id,
-            ..Atlas::new()
-        };
+        let r = Atlas::new();
+        r.inner.lock().unwrap().last_init_kf_id_map = id;
         r.create_new_map();
         r
     }
 
-    pub fn create_new_map(&mut self) {
-        if let Some(current_map) = self.current_map.as_ref() {
+    /// Clone the current map out under a short-lived lock. Used by the accessors
+    /// that only operate on the current map, so the atlas lock is never held
+    /// while doing actual work inside `Map`.
+    fn current_map(&self) -> Option<Arc<Map>> {
+        self.inner.lock().unwrap().current_map.clone()
+    }
+
+    pub fn create_new_map(&self) {
+        let mut inner = self.inner.lock().unwrap();
+
+        // Clone (Arc) so the borrow on `inner.current_map` is released before we
+        // mutate `inner.last_init_kf_id_map` through the same guard.
+        if let Some(current_map) = inner.current_map.clone() {
             let max = current_map.get_max_kf_id();
-            if !self.maps.is_empty() && self.last_init_kf_id_map < max {
-                self.last_init_kf_id_map = max + 1;
+            if !inner.maps.is_empty() && inner.last_init_kf_id_map < max {
+                inner.last_init_kf_id_map = max + 1;
             }
 
             current_map.set_stored_map();
@@ -189,24 +222,24 @@ impl Atlas {
 
         info!(
             "Creation of new map with last KF id: {}",
-            self.last_init_kf_id_map
+            inner.last_init_kf_id_map
         );
 
-        let new_map = Map::with_init_kf_id(self.last_init_kf_id_map);
+        let new_map = Map::with_init_kf_id(inner.last_init_kf_id_map);
         new_map.set_current_map();
         let id = new_map.get_id();
         info!("Creation of new map with ID: {}", id);
         let m = Arc::new(new_map);
-        self.current_map = Some(m.clone());
-        self.maps.insert(id, m);
+        inner.current_map = Some(m.clone());
+        inner.maps.insert(id, m);
     }
 
     pub fn get_last_init_kf_id(&self) -> u64 {
-        self.last_init_kf_id_map
+        self.inner.lock().unwrap().last_init_kf_id_map
     }
 
-    pub fn set_viewer(&mut self, viewer: Arc<Viewer>) {
-        self.viewer = Some(viewer);
+    pub fn set_viewer(&self, viewer: Arc<Viewer>) {
+        self.inner.lock().unwrap().viewer = Some(viewer);
     }
 
     // Method to change components in the current map
@@ -222,122 +255,125 @@ impl Atlas {
         }
     }
 
-    pub fn add_camera(&mut self, cam: Arc<dyn GeometricCamera>) -> Arc<dyn GeometricCamera> {
+    pub fn add_camera(&self, cam: Arc<dyn GeometricCamera>) -> Arc<dyn GeometricCamera> {
+        let mut inner = self.inner.lock().unwrap();
         // Check if the camera already exists
-        if let Some(i) = self.cameras.iter().position(|c| cam.is_equal(c)) {
-            self.cameras[i].clone()
+        if let Some(i) = inner.cameras.iter().position(|c| cam.is_equal(c)) {
+            inner.cameras[i].clone()
         } else {
-            self.cameras.push(cam.clone());
+            inner.cameras.push(cam.clone());
             cam
         }
     }
 
     pub fn get_all_cameras(&self) -> Vec<Arc<dyn GeometricCamera>> {
-        self.cameras.clone()
+        self.inner.lock().unwrap().cameras.clone()
     }
 
     // All methods without Map pointer work on current map
     pub fn set_reference_map_points(&self, mps: Vec<Arc<MapPoint>>) {
-        if let Some(current_map) = self.current_map.as_ref() {
+        if let Some(current_map) = self.current_map() {
             current_map.set_reference_map_points(mps);
         }
     }
     pub fn inform_new_big_change(&self) {
-        if let Some(current_map) = self.current_map.as_ref() {
+        if let Some(current_map) = self.current_map() {
             current_map.inform_new_big_change();
         }
     }
     pub fn get_last_big_change_idx(&self) -> Option<u32> {
-        self.current_map
-            .as_ref()
-            .map(|m| m.get_last_big_change_idx())
+        self.current_map().map(|m| m.get_last_big_change_idx())
     }
 
     pub fn map_points_in_map(&self) -> Option<usize> {
-        self.current_map.as_ref().map(|m| m.map_points_in_map())
+        self.current_map().map(|m| m.map_points_in_map())
     }
     pub fn key_frames_in_map(&self) -> Option<usize> {
-        self.current_map.as_ref().map(|m| m.key_frames_in_map())
+        self.current_map().map(|m| m.key_frames_in_map())
     }
 
     // Method for get data in current map
     pub fn get_all_key_frames(&self) -> Option<Vec<Arc<KeyFrame>>> {
-        self.current_map.as_ref().map(|m| m.get_all_key_frames())
+        self.current_map().map(|m| m.get_all_key_frames())
     }
     pub fn get_all_map_points(&self) -> Option<Vec<Arc<MapPoint>>> {
-        self.current_map.as_ref().map(|m| m.get_all_map_points())
+        self.current_map().map(|m| m.get_all_map_points())
     }
     pub fn get_reference_map_points(&self) -> Option<Vec<Arc<MapPoint>>> {
-        self.current_map
-            .as_ref()
-            .map(|m| m.get_reference_map_points())
+        self.current_map().map(|m| m.get_reference_map_points())
     }
 
     pub fn get_all_maps(&self) -> Vec<Arc<Map>> {
-        let mut maps: Vec<_> = self.maps.values().cloned().collect();
+        let mut maps: Vec<_> = self.inner.lock().unwrap().maps.values().cloned().collect();
         maps.sort_by_key(|m| m.get_id());
         maps
     }
 
     pub fn count_maps(&self) -> usize {
-        self.maps.len()
+        self.inner.lock().unwrap().maps.len()
     }
 
-    pub fn clear_map(&mut self) {
-        if let Some(current_map) = self.current_map.as_ref() {
+    pub fn clear_map(&self) {
+        if let Some(current_map) = self.current_map() {
             current_map.clear();
         }
     }
 
-    pub fn clear_atlas(&mut self) {
-        self.maps.clear();
-        self.bad_maps.clear();
-        self.current_map.take();
-        self.last_init_kf_id_map = 0;
+    pub fn clear_atlas(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.maps.clear();
+        inner.bad_maps.clear();
+        inner.current_map.take();
+        inner.last_init_kf_id_map = 0;
     }
 
-    pub fn get_current_map(&mut self) -> Arc<Map> {
-        if let Some(current_map) = self.current_map.as_ref() {
-            current_map.clone()
-        } else {
-            self.create_new_map();
-            loop {
-                if !self.current_map.as_ref().unwrap().is_bad() {
-                    break;
-                }
-                // TODO: why do we spin lock here?
-                std::thread::sleep(Duration::from_micros(3000));
+    pub fn get_current_map(&self) -> Arc<Map> {
+        // Fast path: a current map already exists.
+        if let Some(current_map) = self.current_map() {
+            return current_map;
+        }
+        self.create_new_map();
+        loop {
+            // Re-clone under a short lock each iteration; never sleep while the
+            // guard is held.
+            let current_map = self
+                .current_map()
+                .expect("create_new_map always sets current_map");
+            if !current_map.is_bad() {
+                return current_map;
             }
-            self.current_map.as_ref().unwrap().clone()
+            // TODO: why do we spin lock here?
+            std::thread::sleep(Duration::from_micros(3000));
         }
     }
 
-    pub fn set_map_bad(&mut self, map: Arc<Map>) {
+    pub fn set_map_bad(&self, map: Arc<Map>) {
         let id = map.get_id();
-        self.maps.remove(&id);
+        let mut inner = self.inner.lock().unwrap();
+        inner.maps.remove(&id);
         map.set_bad();
-        self.bad_maps.insert(id, map);
+        inner.bad_maps.insert(id, map);
     }
 
-    pub fn remove_bad_maps(&mut self) {
-        self.bad_maps.clear();
+    pub fn remove_bad_maps(&self) {
+        self.inner.lock().unwrap().bad_maps.clear();
     }
 
     pub fn is_inertial(&self) -> Option<bool> {
-        self.current_map.as_ref().map(|m| m.is_inertial())
+        self.current_map().map(|m| m.is_inertial())
     }
     pub fn set_inertial_sensor(&self) {
-        if let Some(current_map) = self.current_map.as_ref() {
+        if let Some(current_map) = self.current_map() {
             current_map.set_inertial_sensor();
         }
     }
     pub fn set_imu_initialized(&self) {
-        if let Some(current_map) = self.current_map.as_ref() {
+        if let Some(current_map) = self.current_map() {
             current_map.set_imu_initialized();
         }
     }
     pub fn is_imu_initialized(&self) -> Option<bool> {
-        self.current_map.as_ref().map(|m| m.is_imu_initialized())
+        self.current_map().map(|m| m.is_imu_initialized())
     }
 
     /// Prepare the atlas for serialization (`Atlas::PreSave`).
@@ -347,30 +383,37 @@ impl Atlas {
     /// ([`Map::pre_save`]). The actual pointer→id conversion happens lazily in
     /// the [`Serialize`] implementation via [`Map::to_snapshot`]. Call this before
     /// serializing the atlas.
-    pub fn pre_save(&mut self) {
-        if let Some(current_map) = self.current_map.as_ref() {
-            let max = current_map.get_max_kf_id();
-            if !self.maps.is_empty() && self.last_init_kf_id_map < max {
-                self.last_init_kf_id_map = max + 1;
+    pub fn pre_save(&self) {
+        // Collect the maps to discard while holding the lock, then release it
+        // before calling `set_map_bad` / `remove_bad_maps` (which re-lock).
+        let maps_to_mark_bad: Vec<_> = {
+            let mut inner = self.inner.lock().unwrap();
+
+            let max = inner.current_map.as_ref().map(|m| m.get_max_kf_id());
+            if let Some(max) = max
+                && !inner.maps.is_empty()
+                && inner.last_init_kf_id_map < max
+            {
+                inner.last_init_kf_id_map = max + 1;
             }
-        }
 
-        let cams = self.cameras.clone();
+            let cams = inner.cameras.clone();
 
-        let maps_to_mark_bad: Vec<_> = self
-            .maps
-            .iter()
-            .filter_map(|(_idx, map)| {
-                if map.is_bad() {
-                    return None;
-                }
-                if map.get_all_key_frames().is_empty() {
-                    return Some(map.clone());
-                }
-                map.pre_save(&cams);
-                None
-            })
-            .collect();
+            inner
+                .maps
+                .values()
+                .filter_map(|map| {
+                    if map.is_bad() {
+                        return None;
+                    }
+                    if map.get_all_key_frames().is_empty() {
+                        return Some(map.clone());
+                    }
+                    map.pre_save(&cams);
+                    None
+                })
+                .collect()
+        };
 
         for map in maps_to_mark_bad {
             self.set_map_bad(map);
@@ -388,12 +431,15 @@ impl Atlas {
     ///
     /// [`set_key_frame_database`]: Atlas::set_key_frame_database
     /// [`set_orb_vocabulary`]: Atlas::set_orb_vocabulary
-    pub fn post_load(&mut self) {
-        let (Some(db), Some(voc)) = (self.key_frame_database.clone(), self.orb_vocabulary.clone())
-        else {
+    pub fn post_load(&self) {
+        let inner = self.inner.lock().unwrap();
+        let (Some(db), Some(voc)) = (
+            inner.key_frame_database.clone(),
+            inner.orb_vocabulary.clone(),
+        ) else {
             return;
         };
-        for map in self.maps.values() {
+        for map in inner.maps.values() {
             map.post_load(db.clone(), voc.clone());
         }
     }
@@ -431,8 +477,9 @@ impl Atlas {
     }
 
     pub fn get_atlas_key_frames(&self) -> HashMap<u64, Arc<KeyFrame>> {
+        let inner = self.inner.lock().unwrap();
         let mut ret = HashMap::new();
-        for map in self.maps.values() {
+        for map in inner.maps.values() {
             let keyframes = map.get_all_key_frames();
             for kf in keyframes {
                 ret.insert(kf.id, kf.clone());
@@ -441,28 +488,34 @@ impl Atlas {
         ret
     }
 
-    pub fn set_key_frame_database(&mut self, db: Arc<KeyFrameDatabase>) {
-        self.key_frame_database = Some(db);
+    pub fn set_key_frame_database(&self, db: Arc<KeyFrameDatabase>) {
+        self.inner.lock().unwrap().key_frame_database = Some(db);
     }
     pub fn get_key_frame_database(&self) -> Option<Arc<KeyFrameDatabase>> {
-        self.key_frame_database.clone()
+        self.inner.lock().unwrap().key_frame_database.clone()
     }
 
-    pub fn set_orb_vocabulary(&mut self, voc: Arc<OrbVocabulary>) {
-        self.orb_vocabulary = Some(voc);
+    pub fn set_orb_vocabulary(&self, voc: Arc<OrbVocabulary>) {
+        self.inner.lock().unwrap().orb_vocabulary = Some(voc);
     }
     pub fn get_orb_vocabulary(&self) -> Option<Arc<OrbVocabulary>> {
-        self.orb_vocabulary.clone()
+        self.inner.lock().unwrap().orb_vocabulary.clone()
     }
 
     pub fn get_num_lived_kdf(&self) -> usize {
-        self.maps
+        self.inner
+            .lock()
+            .unwrap()
+            .maps
             .values()
             .map(|map| map.get_all_key_frames().len())
             .sum()
     }
     pub fn get_num_lived_mp(&self) -> usize {
-        self.maps
+        self.inner
+            .lock()
+            .unwrap()
+            .maps
             .values()
             .map(|map| map.get_all_map_points().len())
             .sum()
@@ -496,7 +549,7 @@ mod tests {
 
     #[test]
     fn create_new_map_sets_current() {
-        let mut atlas = Atlas::new();
+        let atlas = Atlas::new();
         atlas.create_new_map();
         assert_eq!(atlas.count_maps(), 1);
         let m = atlas.get_current_map();
@@ -507,7 +560,7 @@ mod tests {
     #[test]
     fn from_kf_id_creates_first_map() {
         let id: u64 = 41;
-        let mut atlas = Atlas::from_kf_id(id);
+        let atlas = Atlas::from_kf_id(id);
         assert_eq!(atlas.count_maps(), 1);
         assert_eq!(atlas.get_last_init_kf_id(), id);
         assert_eq!(atlas.get_current_map().get_init_kf_id(), id);
@@ -515,7 +568,7 @@ mod tests {
 
     #[test]
     fn create_new_map_advances_last_init_kf_id() {
-        let mut atlas = Atlas::new();
+        let atlas = Atlas::new();
         atlas.create_new_map();
         let m = atlas.get_current_map();
         // Two keyframes guarantee max_kf_id >= 1, so it is strictly greater than
@@ -536,7 +589,7 @@ mod tests {
 
     #[test]
     fn get_current_map_creates_when_absent() {
-        let mut atlas = Atlas::new();
+        let atlas = Atlas::new();
         assert_eq!(atlas.count_maps(), 0);
         let m = atlas.get_current_map();
         assert!(!m.is_bad());
@@ -545,7 +598,7 @@ mod tests {
 
     #[test]
     fn set_map_bad_moves_out_of_live_set() {
-        let mut atlas = Atlas::new();
+        let atlas = Atlas::new();
         atlas.create_new_map();
         let first = atlas.get_current_map();
         atlas.create_new_map();
@@ -561,7 +614,7 @@ mod tests {
 
     #[test]
     fn clear_atlas_resets_everything() {
-        let mut atlas = Atlas::from_kf_id(10);
+        let atlas = Atlas::from_kf_id(10);
         atlas.create_new_map();
         assert!(atlas.count_maps() >= 1);
 
@@ -573,7 +626,7 @@ mod tests {
 
     #[test]
     fn clear_map_empties_current_but_keeps_it() {
-        let mut atlas = Atlas::new();
+        let atlas = Atlas::new();
         atlas.create_new_map();
         let m = atlas.get_current_map();
         m.add_key_frame(kf_in(&m));
@@ -587,7 +640,7 @@ mod tests {
 
     #[test]
     fn add_camera_dedups_equal_and_keeps_distinct() {
-        let mut atlas = Atlas::new();
+        let atlas = Atlas::new();
         let c1 = atlas.add_camera(pinhole(vec![1.0, 2.0, 3.0, 4.0]));
         let c2 = atlas.add_camera(pinhole(vec![1.0, 2.0, 3.0, 4.0]));
         assert_eq!(atlas.get_all_cameras().len(), 1);
@@ -600,7 +653,7 @@ mod tests {
 
     #[test]
     fn imu_and_inertial_flags_route_to_current_map() {
-        let mut atlas = Atlas::new();
+        let atlas = Atlas::new();
         atlas.create_new_map();
 
         assert_eq!(atlas.is_inertial(), Some(false));
@@ -614,7 +667,7 @@ mod tests {
 
     #[test]
     fn get_all_maps_sorted_by_id() {
-        let mut atlas = Atlas::new();
+        let atlas = Atlas::new();
         atlas.create_new_map();
         atlas.create_new_map();
         atlas.create_new_map();
@@ -628,7 +681,7 @@ mod tests {
 
     #[test]
     fn num_lived_and_atlas_keyframes_span_all_maps() {
-        let mut atlas = Atlas::new();
+        let atlas = Atlas::new();
         atlas.create_new_map();
         let m1 = atlas.get_current_map();
         let a = kf_in(&m1);
@@ -655,7 +708,7 @@ mod tests {
     /// back-pointer dangling rather than keeping the map alive forever.
     #[test]
     fn weak_back_pointer_breaks_cycle() {
-        let mut atlas = Atlas::new();
+        let atlas = Atlas::new();
         atlas.create_new_map();
         let map = atlas.get_current_map();
         let kf = kf_in(&map);
@@ -767,7 +820,7 @@ mod tests {
         use crate::map_point::MapPoint;
         use nalgebra::Vector3;
 
-        let mut atlas = Atlas::new();
+        let atlas = Atlas::new();
         atlas.create_new_map();
         let map = atlas.get_current_map();
 

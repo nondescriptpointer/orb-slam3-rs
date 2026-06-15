@@ -85,9 +85,9 @@ impl System {
         // Create keyframe database
         let keyframe_database = Arc::new(KeyFrameDatabase::new(vocabulary.clone()));
 
-        let mut atlas = if let Some(load_path) = &settings.load_and_save.load_from {
+        let atlas = if let Some(load_path) = &settings.load_and_save.load_from {
             info!("Initialization of Atlas from file: {}", load_path);
-            let mut ret = load_atlas(
+            let ret = load_atlas(
                 load_path,
                 vocabulary_path,
                 keyframe_database.clone(),
@@ -176,7 +176,7 @@ fn load_atlas(
         return Err(AtlasLoadError::IncompatibleVocabulary(snapshot.file_voc));
     }
 
-    let mut atlas = snapshot.atlas;
+    let atlas = snapshot.atlas;
     atlas.set_key_frame_database(key_frame_database);
     atlas.set_orb_vocabulary(orb_vocabulary);
     atlas.post_load();

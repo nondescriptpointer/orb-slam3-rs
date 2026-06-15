@@ -215,12 +215,11 @@ pub enum TrackingState {
 }
 
 impl Tracking {
-    fn new(
+    pub fn new(
         system: Arc<System>,
         orb_vocabulary: Arc<OrbVocabulary>,
         atlas: Arc<Atlas>,
         key_frame_database: Arc<KeyFrameDatabase>,
-        settings_path: String,
         sensor: Sensor,
         settings: Arc<Settings>,
     ) -> Self {
@@ -501,5 +500,3 @@ impl Tracking {
         // TODO
     }
 }
-
-fn load_settings(settings: Arc<Settings>) {}

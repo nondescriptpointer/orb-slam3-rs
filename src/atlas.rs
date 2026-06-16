@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -91,10 +91,10 @@ impl<'de> Deserialize<'de> for Atlas {
                 current_map: None,
                 cameras,
                 last_init_kf_id_map: snapshot.last_init_kf_id_map,
-                viewer: None,
-                key_frame_database: None,
-                orb_vocabulary: None,
             }),
+            viewer: OnceLock::new(),
+            key_frame_database: OnceLock::new(),
+            orb_vocabulary: OnceLock::new(),
         })
     }
 }
@@ -143,6 +143,14 @@ pub struct Atlas {
     /// `&self`. Critical sections are intentionally short: the heavy lifting
     /// happens inside `Map`, which carries its own interior locks.
     inner: Mutex<AtlasInner>,
+
+    /// Set-once dependency wiring, injected after construction and never
+    /// cleared. Kept outside `inner` so reads are lock-free and don't contend
+    /// on the atlas mutex (`OnceLock` instead of a mutex-guarded `Option`).
+    viewer: OnceLock<Arc<Viewer>>,
+    // Class references for the map reconstruction from the save field
+    key_frame_database: OnceLock<Arc<KeyFrameDatabase>>,
+    orb_vocabulary: OnceLock<Arc<OrbVocabulary>>,
 }
 
 struct AtlasInner {
@@ -155,12 +163,6 @@ struct AtlasInner {
     cameras: Vec<Arc<dyn GeometricCamera>>,
 
     last_init_kf_id_map: u64,
-
-    viewer: Option<Arc<Viewer>>,
-
-    // Class references for the map reconstruction from the save field
-    key_frame_database: Option<Arc<KeyFrameDatabase>>,
-    orb_vocabulary: Option<Arc<OrbVocabulary>>,
 }
 
 impl AtlasInner {
@@ -171,9 +173,6 @@ impl AtlasInner {
             current_map: None,
             cameras: Vec::new(),
             last_init_kf_id_map: 0,
-            viewer: None,
-            key_frame_database: None,
-            orb_vocabulary: None,
         }
     }
 }
@@ -188,6 +187,9 @@ impl Atlas {
     pub fn new() -> Self {
         Atlas {
             inner: Mutex::new(AtlasInner::new()),
+            viewer: OnceLock::new(),
+            key_frame_database: OnceLock::new(),
+            orb_vocabulary: OnceLock::new(),
         }
     }
 
@@ -239,7 +241,8 @@ impl Atlas {
     }
 
     pub fn set_viewer(&self, viewer: Arc<Viewer>) {
-        self.inner.lock().unwrap().viewer = Some(viewer);
+        // Set-once wiring; ignore a second set (mirrors upstream's single call).
+        let _ = self.viewer.set(viewer);
     }
 
     // Method to change components in the current map
@@ -432,13 +435,11 @@ impl Atlas {
     /// [`set_key_frame_database`]: Atlas::set_key_frame_database
     /// [`set_orb_vocabulary`]: Atlas::set_orb_vocabulary
     pub fn post_load(&self) {
-        let inner = self.inner.lock().unwrap();
-        let (Some(db), Some(voc)) = (
-            inner.key_frame_database.clone(),
-            inner.orb_vocabulary.clone(),
-        ) else {
+        let (Some(db), Some(voc)) = (self.key_frame_database.get(), self.orb_vocabulary.get())
+        else {
             return;
         };
+        let inner = self.inner.lock().unwrap();
         for map in inner.maps.values() {
             map.post_load(db.clone(), voc.clone());
         }
@@ -489,17 +490,17 @@ impl Atlas {
     }
 
     pub fn set_key_frame_database(&self, db: Arc<KeyFrameDatabase>) {
-        self.inner.lock().unwrap().key_frame_database = Some(db);
+        let _ = self.key_frame_database.set(db);
     }
     pub fn get_key_frame_database(&self) -> Option<Arc<KeyFrameDatabase>> {
-        self.inner.lock().unwrap().key_frame_database.clone()
+        self.key_frame_database.get().cloned()
     }
 
     pub fn set_orb_vocabulary(&self, voc: Arc<OrbVocabulary>) {
-        self.inner.lock().unwrap().orb_vocabulary = Some(voc);
+        let _ = self.orb_vocabulary.set(voc);
     }
     pub fn get_orb_vocabulary(&self) -> Option<Arc<OrbVocabulary>> {
-        self.inner.lock().unwrap().orb_vocabulary.clone()
+        self.orb_vocabulary.get().cloned()
     }
 
     pub fn get_num_lived_kdf(&self) -> usize {

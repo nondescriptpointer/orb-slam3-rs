@@ -535,89 +535,63 @@ impl Tracking {
         )
         .unwrap();
 
-        // Construct the frame
-        // TODO: refactor this to be DRY
-        if self.sensor == Sensor::Stereo && self.camera2.is_none() {
-            self.current_frame = Frame::from_stereo(
+        // Construct the frame. Two orthogonal axes of variation:
+        //   - IMU vs non-IMU: whether we chain to the previous frame and which
+        //     IMU calibration is used.
+        //   - fisheye (two cameras) vs single pinhole: which constructor and
+        //     whether `camera2`/`tlr` are supplied.
+        let (prev_frame, imu_calib) = match self.sensor {
+            Sensor::Stereo => (None, Arc::new(Calib::new())),
+            Sensor::IMUStereo => (
+                self.last_frame.clone(),
+                self.imu_calib.as_ref().expect("missing imu calib").clone(),
+            ),
+            // grab_image_stereo is only valid for stereo sensors.
+            _ => return None,
+        };
+
+        let extractor_left = self.orb_extractor_left.clone();
+        let extractor_right = self
+            .orb_extractor_right
+            .as_ref()
+            .expect("missing right extractor")
+            .clone();
+        let bf = self.bf.expect("missing bf");
+        let th_depth = self.th_depth.expect("missing th_depth");
+
+        self.current_frame = if let Some(camera2) = &self.camera2 {
+            Frame::from_stereo_fisheye(
                 &im_gray,
                 &im_right,
                 timestamp,
-                self.orb_extractor_left.clone(),
-                self.orb_extractor_right
-                    .as_ref()
-                    .expect("missing right extractor")
-                    .clone(),
+                extractor_left,
+                extractor_right,
                 self.orb_vocabulary.clone(),
                 self.frame_constants.clone(),
-                self.bf.expect("missing bf"),
-                self.th_depth.expect("missing th_depth"),
-                self.camera.clone(),
-                None,
-                Arc::new(Calib::new()),
-            );
-        } else if self.sensor == Sensor::Stereo
-            && let Some(camera2) = &self.camera2
-        {
-            self.current_frame = Frame::from_stereo_fisheye(
-                &im_gray,
-                &im_right,
-                timestamp,
-                self.orb_extractor_left.clone(),
-                self.orb_extractor_right
-                    .as_ref()
-                    .expect("missing right extractor")
-                    .clone(),
-                self.orb_vocabulary.clone(),
-                self.frame_constants.clone(),
-                self.bf.expect("missing bf"),
-                self.th_depth.expect("missing th_depth"),
+                bf,
+                th_depth,
                 self.camera.clone(),
                 camera2.clone(),
                 self.tlr.expect("missing tlr"),
-                None,
-                Arc::new(Calib::new()),
-            );
-        } else if self.sensor == Sensor::IMUStereo && self.camera2.is_none() {
-            self.current_frame = Frame::from_stereo(
+                prev_frame,
+                imu_calib,
+            )
+        } else {
+            Frame::from_stereo(
                 &im_gray,
                 &im_right,
                 timestamp,
-                self.orb_extractor_left.clone(),
-                self.orb_extractor_right
-                    .as_ref()
-                    .expect("missing right extractor")
-                    .clone(),
+                extractor_left,
+                extractor_right,
                 self.orb_vocabulary.clone(),
                 self.frame_constants.clone(),
-                self.bf.expect("missing bf"),
-                self.th_depth.expect("missing th_depth"),
+                bf,
+                th_depth,
                 self.camera.clone(),
-                self.last_frame.clone(),
-                self.imu_calib.as_ref().expect("missing imu calib").clone(),
-            );
-        } else if self.sensor == Sensor::IMUStereo
-            && let Some(camera2) = &self.camera2
-        {
-            self.current_frame = Frame::from_stereo_fisheye(
-                &im_gray,
-                &im_right,
-                timestamp,
-                self.orb_extractor_left.clone(),
-                self.orb_extractor_right
-                    .as_ref()
-                    .expect("missing right extractor")
-                    .clone(),
-                self.orb_vocabulary.clone(),
-                self.frame_constants.clone(),
-                self.bf.expect("missing bf"),
-                self.th_depth.expect("missing th_depth"),
-                self.camera.clone(),
-                camera2.clone(),
-                self.tlr.expect("missing tlr"),
-                self.last_frame.clone(),
-                self.imu_calib.as_ref().expect("missing imu calib").clone(),
-            );
-        }
+                prev_frame,
+                imu_calib,
+            )
+        };
 
         if let Some(current_frame) = self.current_frame.as_mut() {
             current_frame.name_file = filename;
@@ -630,8 +604,7 @@ impl Tracking {
         }
 
         if self.current_frame.is_some() {
-            // TODO:
-            // Call Track
+            self.track();
 
             return Some(self.current_frame.as_ref().unwrap().get_pose());
         }
@@ -641,6 +614,9 @@ impl Tracking {
 
         None
     }
+
+    // Main tracking function. It is independent of the input sensor
+    fn track(&mut self) {}
 
     #[cfg(feature = "register-times")]
     pub fn local_map_stats_to_file(&self) {

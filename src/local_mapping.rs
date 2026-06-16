@@ -42,6 +42,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use tracing::info;
 
 use crate::{
     atlas::Atlas, key_frame::KeyFrame, loop_closing::LoopClosing, map::Map, map_point::MapPoint,
@@ -102,7 +103,7 @@ struct ImuInitState {
     num_lm: usize,
     num_kf_culling: usize,
     /// Elapsed time since first keyframe used for IMU init
-    t_init: f32,
+    t_init: f64,
 }
 
 impl ImuInitState {
@@ -149,6 +150,27 @@ struct RegisterTimes {
     lba_mps: Vec<usize>,
     lba_exec: usize,
     lba_abort: usize,
+}
+
+/// Times `$body` and—when the `register-times` feature is active—appends the
+/// elapsed milliseconds to `$rt.lock().unwrap().$field`.
+///
+/// When the feature is disabled the macro reduces to a plain expression, so
+/// call sites need no `#[cfg]` attributes at all.
+macro_rules! timed {
+    ($rt:expr, $field:ident, $body:expr) => {{
+        #[cfg(feature = "register-times")]
+        let _t0 = ::std::time::Instant::now();
+        let _v = { $body };
+        #[cfg(feature = "register-times")]
+        {
+            $rt.lock()
+                .unwrap()
+                .$field
+                .push(_t0.elapsed().as_secs_f64() * 1000.);
+        }
+        _v
+    }};
 }
 
 pub struct LocalMapping {
@@ -250,38 +272,87 @@ impl LocalMapping {
 
             // check if there are keyframes in the queue
             if self.check_new_key_frames() && !self.bad_imu.load(Ordering::SeqCst) {
-                #[cfg(feature = "register-times")]
-                let time_lba_ms = 0;
-                #[cfg(feature = "register-times")]
-                let time_kf_culling_ms = 0;
+                // BoW conversion and insertion in Map
+                timed!(
+                    self.register_times,
+                    kf_insert_ms,
+                    self.process_new_key_frame()
+                );
 
-                #[cfg(feature = "register-times")]
-                let time_start = std::time::Instant::now();
+                // Check recent MapPoints
+                timed!(self.register_times, mp_culling_ms, self.map_point_culling());
 
-                self.process_new_key_frame();
+                timed!(self.register_times, mp_creation_ms, {
+                    // Triangulate new MapPoints
+                    self.create_new_map_points();
 
-                #[cfg(feature = "register-times")]
+                    self.abort_ba.store(true, Ordering::SeqCst);
+
+                    if !self.check_new_key_frames() {
+                        // Find more matches in neighbor keyframes and fuse point duplications
+                        self.search_in_neighbors();
+                    }
+                });
+
+                let mut done_lba = false;
+                let mut fixed_kf_ba = 0;
+                let mut opt_kf_ba = 0;
+                let mut mps_ba = 0;
+                let mut edged_ba = 0;
+
+                if !self.check_new_key_frames()
+                    && !self.stop_requested()
+                    && let Some(current_keyframe) = self.current_key_frame.lock().unwrap().as_ref()
                 {
-                    self.register_times
-                        .lock()
-                        .unwrap()
-                        .kf_insert_ms
-                        .push(time_start.elapsed().as_secs_f64() * 1000.);
+                    if let Some(key_frames) = self.atlas.key_frames_in_map()
+                        && key_frames > 2
+                    {
+                        if self.inertial
+                            && let Some(map) = current_keyframe.get_map()
+                            && map.is_imu_initialized()
+                        {
+                            if let Some(previous_kf) = current_keyframe.get_prev_kf()
+                                && let Some(previous_previous_kf) = previous_kf.get_prev_kf()
+                            {
+                                let dist = (previous_kf.get_camera_center()
+                                    - current_keyframe.get_camera_center())
+                                .norm()
+                                    + (previous_previous_kf.get_camera_center()
+                                        - previous_kf.get_camera_center())
+                                    .norm();
+
+                                if dist > 0.05 {
+                                    self.imu_init.lock().unwrap().t_init +=
+                                        current_keyframe.timestamp - previous_kf.timestamp;
+                                }
+
+                                if !map.get_inertial_ba2() {
+                                    if self.imu_init.lock().unwrap().t_init < 10. && dist < 0.02 {
+                                        info!("Not enough motion for initializing. Resetting...");
+                                        {
+                                            let mut reset = self.reset.lock().unwrap();
+                                            reset.reset_requested_active_map = true;
+                                            reset.map_to_reset = Some(map);
+                                            self.bad_imu.store(true, Ordering::SeqCst);
+                                        }
+                                    }
+                                }
+
+                                let inliers = self.tracker.get().unwrap().get_matches_inliers();
+                                let large = ((inliers > 75) && self.monocular)
+                                    || ((inliers > 100) && !self.monocular);
+                                // TODO: Optimizer
+                                done_lba = true;
+                            }
+                        } else {
+                            // TODO: Optimizer
+                            done_lba = true;
+                        }
+                    }
+
+                    // TODO
                 }
-
-                #[cfg(feature = "register-times")]
-                let time_start = std::time::Instant::now();
-
-                self.map_point_culling();
-
-                #[cfg(feature = "register-times")]
-                {
-                    self.register_times
-                        .lock()
-                        .unwrap()
-                        .mp_culling_ms
-                        .push(time_start.elapsed().as_secs_f64() * 1000.);
-                }
+                // TODO
             }
         }
     }
@@ -344,8 +415,7 @@ impl LocalMapping {
         false
     }
 
-    /// Resume the loop and clear the keyframe queue (upstream `Release`).
-    ///
+    /// Resume the loop and clear the keyframe queue
     /// Acquires `finish` before `stop` to honour the global lock order (this is
     /// the deadlock fix relative to upstream's `Release`).
     pub fn release(&self) {
@@ -376,7 +446,7 @@ impl LocalMapping {
     }
 
     /// Set the not-stop flag. Returns `false` if it could not be set because
-    /// the loop is already stopped (upstream `SetNotStop`).
+    /// the loop is already stopped
     pub fn set_not_stop(&self, flag: bool) -> bool {
         let mut stop = self.stop.lock().unwrap();
         if flag && stop.stopped {
@@ -419,7 +489,7 @@ impl LocalMapping {
         self.bad_imu.load(Ordering::SeqCst)
     }
 
-    // --- internal loop steps (ported incrementally) -----------------------
+    // --- internal loop steps -----------------------
 
     fn check_new_key_frames(&self) -> bool {
         !self.new_key_frames.lock().unwrap().is_empty()
@@ -436,7 +506,7 @@ impl LocalMapping {
     fn search_in_neighbors(&self) {}
     fn key_frame_culling(&self) {}
 
-    /// Apply a pending reset if one was requested (upstream `ResetIfRequested`).
+    /// Apply a pending reset if one was requested
     fn reset_if_requested(&self) {
         let mut reset = self.reset.lock().unwrap();
         if !reset.reset_requested && !reset.reset_requested_active_map {
@@ -466,8 +536,7 @@ impl LocalMapping {
         self.finish.lock().unwrap().finish_requested
     }
 
-    /// Mark the loop finished and stopped (upstream `SetFinish`).
-    ///
+    /// Mark the loop finished and stopped
     /// Acquires `finish` before `stop`, matching the global lock order.
     fn set_finished(&self) {
         let mut finish = self.finish.lock().unwrap();

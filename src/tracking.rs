@@ -168,7 +168,7 @@ pub struct Tracking {
     depth_map_factor: Option<f32>,
 
     // Current matches in frame
-    matches_inliers: Option<usize>,
+    matches_inliers: usize,
 
     // Last Frame, KeyFrame and Relocalisation info
     last_key_frame: Option<Arc<KeyFrame>>,
@@ -446,7 +446,7 @@ impl Tracking {
             local_mapper: None,
             loop_closing: None,
             lost: Vec::new(),
-            matches_inliers: None,
+            matches_inliers: 0,
             #[cfg(feature = "tracker-pause-resume")]
             stopped: false,
             #[cfg(feature = "tracker-pause-resume")]
@@ -634,6 +634,10 @@ impl Tracking {
         }
 
         // TODO
+    }
+
+    pub fn get_matches_inliers(&self) -> usize {
+        self.matches_inliers
     }
 
     #[cfg(feature = "register-times")]

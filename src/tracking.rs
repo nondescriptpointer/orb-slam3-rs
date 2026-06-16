@@ -1,7 +1,7 @@
 use crate::{
     atlas::Atlas,
     camera_models::GeometricCamera,
-    frame::Frame,
+    frame::{Frame, FrameConstants},
     imu_types::{Bias, Calib, Point, Preintegrated},
     key_frame::KeyFrame,
     key_frame_database::KeyFrameDatabase,
@@ -14,10 +14,14 @@ use crate::{
     system::{Sensor, System},
 };
 use nalgebra::{Isometry3, Matrix3};
-use opencv::core::{CV_32F, Mat, MatExprTraitConst, Point2f, Point3f, Scalar};
+use opencv::imgproc::cvt_color;
 use opencv::prelude::*;
-use std::{fs::File, fs::OpenOptions, io::BufWriter, sync::Arc};
-use tracing::info;
+use opencv::{
+    core::{ALGO_HINT_DEFAULT, CV_32F, Mat, MatExprTraitConst, Point2f, Point3f, Scalar},
+    imgproc::ColorConversionCodes,
+};
+use std::sync::Arc;
+use tracing::{info, warn};
 
 pub struct Tracking {
     pub state: TrackingState,
@@ -28,7 +32,7 @@ pub struct Tracking {
 
     // Current frame
     pub current_frame: Option<Frame>,
-    pub last_frame: Option<Frame>,
+    pub last_frame: Option<Arc<Frame>>,
 
     pub im_gray: Option<Mat>,
     pub im_right: Option<Mat>,
@@ -137,6 +141,10 @@ pub struct Tracking {
     k: Mat,
     k_n: Matrix3<f32>,
     dist_coef: Mat,
+
+    // Per-camera constants shared by every Frame (C++ Frame statics:
+    // image bounds, grid inv sizes, intrinsics).
+    frame_constants: Arc<FrameConstants>,
     bf: Option<f32>,
     image_scale: f32,
 
@@ -247,6 +255,22 @@ impl Tracking {
         *k.at_2d_mut::<f32>(1, 1).unwrap() = fy;
         *k.at_2d_mut::<f32>(0, 2).unwrap() = cx;
         *k.at_2d_mut::<f32>(1, 2).unwrap() = cy;
+        // The working image size is known up-front from the settings: every
+        // incoming image is resized to `new_size` before a Frame is built, and
+        // the intrinsics in `k` are already scaled to those pixel coordinates.
+        // This replaces the C++ lazy static computation.
+        let frame_constants = Arc::new(
+            FrameConstants::new(
+                k.clone(),
+                dist_coef.clone(),
+                settings.image.new_size.width,
+                settings.image.new_size.height,
+            )
+            // Infallible for a valid calibration + positive image size, both of
+            // which are validated during settings parsing.
+            .expect("failed to build frame constants from settings"),
+        );
+
         let k_n: Matrix3<f32> = Matrix3::new(fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0);
 
         let (camera2, tlr) =
@@ -288,11 +312,6 @@ impl Tracking {
 
         // ORB parameters
         let orb = &settings.orb;
-        let n_features = orb.n_features;
-        let n_levels = orb.n_levels;
-        let ini_th_fast = orb.init_th_fast;
-        let min_th_fast = orb.min_th_fast;
-        let scale_factor = orb.scale_factor;
         let orb_extractor_left = Arc::new(OrbExtractor::new(
             orb.n_features as usize,
             orb.scale_factor,
@@ -386,6 +405,7 @@ impl Tracking {
             camera2,
             tlr,
             dist_coef,
+            frame_constants,
             image_scale: 1.,
             k,
             k_n,
@@ -464,6 +484,162 @@ impl Tracking {
             #[cfg(feature = "register-times")]
             track_total_ms: Vec::new(),
         }
+    }
+
+    // Preprocess the input and call track(). Extract features and performs stereo matching.
+    pub fn grab_image_stereo(
+        &mut self,
+        im_rect_left: Mat,
+        im_rect_right: Mat,
+        timestamp: f64,
+        filename: String,
+    ) -> Option<Isometry3<f32>> {
+        let mut im_gray = im_rect_left;
+        let mut im_right = im_rect_right;
+
+        // Convert the colors to gray
+        let conversion = match im_gray.channels() {
+            3 => {
+                if self.rgb {
+                    ColorConversionCodes::COLOR_RGB2GRAY
+                } else {
+                    ColorConversionCodes::COLOR_BGR2GRAY
+                }
+            }
+            4 => {
+                if self.rgb {
+                    ColorConversionCodes::COLOR_RGBA2GRAY
+                } else {
+                    ColorConversionCodes::COLOR_BGRA2GRAY
+                }
+            }
+            _ => {
+                warn!("Unexpected number of image channels");
+                ColorConversionCodes::COLOR_RGB2GRAY
+            }
+        };
+        cvt_color(
+            &im_gray.clone(),
+            &mut im_gray,
+            conversion as i32,
+            0,
+            opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )
+        .unwrap();
+        cvt_color(
+            &im_right.clone(),
+            &mut im_right,
+            conversion as i32,
+            0,
+            opencv::core::AlgorithmHint::ALGO_HINT_DEFAULT,
+        )
+        .unwrap();
+
+        // Construct the frame
+        // TODO: refactor this to be DRY
+        if self.sensor == Sensor::Stereo && self.camera2.is_none() {
+            self.current_frame = Frame::from_stereo(
+                &im_gray,
+                &im_right,
+                timestamp,
+                self.orb_extractor_left.clone(),
+                self.orb_extractor_right
+                    .as_ref()
+                    .expect("missing right extractor")
+                    .clone(),
+                self.orb_vocabulary.clone(),
+                self.frame_constants.clone(),
+                self.bf.expect("missing bf"),
+                self.th_depth.expect("missing th_depth"),
+                self.camera.clone(),
+                None,
+                Arc::new(Calib::new()),
+            );
+        } else if self.sensor == Sensor::Stereo
+            && let Some(camera2) = &self.camera2
+        {
+            self.current_frame = Frame::from_stereo_fisheye(
+                &im_gray,
+                &im_right,
+                timestamp,
+                self.orb_extractor_left.clone(),
+                self.orb_extractor_right
+                    .as_ref()
+                    .expect("missing right extractor")
+                    .clone(),
+                self.orb_vocabulary.clone(),
+                self.frame_constants.clone(),
+                self.bf.expect("missing bf"),
+                self.th_depth.expect("missing th_depth"),
+                self.camera.clone(),
+                camera2.clone(),
+                self.tlr.expect("missing tlr"),
+                None,
+                Arc::new(Calib::new()),
+            );
+        } else if self.sensor == Sensor::IMUStereo && self.camera2.is_none() {
+            self.current_frame = Frame::from_stereo(
+                &im_gray,
+                &im_right,
+                timestamp,
+                self.orb_extractor_left.clone(),
+                self.orb_extractor_right
+                    .as_ref()
+                    .expect("missing right extractor")
+                    .clone(),
+                self.orb_vocabulary.clone(),
+                self.frame_constants.clone(),
+                self.bf.expect("missing bf"),
+                self.th_depth.expect("missing th_depth"),
+                self.camera.clone(),
+                self.last_frame.clone(),
+                self.imu_calib.as_ref().expect("missing imu calib").clone(),
+            );
+        } else if self.sensor == Sensor::IMUStereo
+            && let Some(camera2) = &self.camera2
+        {
+            self.current_frame = Frame::from_stereo_fisheye(
+                &im_gray,
+                &im_right,
+                timestamp,
+                self.orb_extractor_left.clone(),
+                self.orb_extractor_right
+                    .as_ref()
+                    .expect("missing right extractor")
+                    .clone(),
+                self.orb_vocabulary.clone(),
+                self.frame_constants.clone(),
+                self.bf.expect("missing bf"),
+                self.th_depth.expect("missing th_depth"),
+                self.camera.clone(),
+                camera2.clone(),
+                self.tlr.expect("missing tlr"),
+                self.last_frame.clone(),
+                self.imu_calib.as_ref().expect("missing imu calib").clone(),
+            );
+        }
+
+        if let Some(current_frame) = self.current_frame.as_mut() {
+            current_frame.name_file = filename;
+            current_frame.dataset = self.num_dataset;
+
+            #[cfg(feature = "register-times")]
+            self.orb_extract_ms.push(current_frame.time_orb_ext);
+            #[cfg(feature = "register-times")]
+            self.stereo_match_ms.push(current_frame.time_stereo_match);
+        }
+
+        if self.current_frame.is_some() {
+            // TODO:
+            // Call Track
+
+            return Some(self.current_frame.as_ref().unwrap().get_pose());
+        }
+
+        self.im_gray = Some(im_gray);
+        self.im_right = Some(im_right);
+
+        None
     }
 
     #[cfg(feature = "register-times")]

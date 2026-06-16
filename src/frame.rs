@@ -179,7 +179,7 @@ pub struct Frame {
     pub imu_bias: Bias,
 
     // IMU calibration
-    pub imu_calib: Calib,
+    pub imu_calib: Arc<Calib>,
 
     // IMU preintegration from last keyframe
     pub imu_preintegrated: Option<Arc<Preintegrated>>,
@@ -235,6 +235,9 @@ pub struct Frame {
 
     // Optimization constraint set by the optimizer.
     pub cpi: Option<ConstraintPoseIMU>,
+
+    pub img_left: Option<Mat>,
+    pub img_right: Option<Mat>,
 
     // nalgebra migration
     t_cw: Isometry3<f32>,
@@ -329,7 +332,7 @@ struct FrameConfig {
     th_depth: f32,
     camera: Arc<dyn GeometricCamera>,
     camera2: Option<Arc<dyn GeometricCamera>>,
-    imu_calib: Calib,
+    imu_calib: Arc<Calib>,
     prev_frame: Option<Arc<Frame>>,
 }
 
@@ -360,6 +363,8 @@ struct ExtractedFrame {
     time_orb_ext: f64,
     #[cfg(feature = "register-times")]
     time_stereo_match: f64,
+    img_left: Option<Mat>,
+    img_right: Option<Mat>,
 }
 
 impl Frame {
@@ -377,8 +382,8 @@ impl Frame {
         th_depth: f32,
         camera: Arc<dyn GeometricCamera>,
         prev_frame: Option<Arc<Frame>>,
-        imu_calib: Calib,
-    ) -> Self {
+        imu_calib: Arc<Calib>, // default to default constructor
+    ) -> Option<Self> {
         #[cfg(feature = "register-times")]
         let time_start_ext_orb = std::time::Instant::now();
 
@@ -399,6 +404,9 @@ impl Frame {
         let descriptors = left_res.descriptors.unwrap_or_default();
         let descriptors_right = right_res.descriptors.unwrap_or_default();
         let n = keys.len();
+        if n == 0 {
+            return None;
+        }
 
         // Undistort keypoints (no-op for already-rectified images).
         let keys_un =
@@ -428,7 +436,7 @@ impl Frame {
         let (grid, grid_right) =
             assign_features_to_grid(n, None, &keys, None, Some(&keys_un), &constants.bounds);
 
-        Self::assemble(
+        Some(Self::assemble(
             FrameConfig {
                 orb_vocabulary,
                 extractor_left,
@@ -467,8 +475,10 @@ impl Frame {
                 time_orb_ext,
                 #[cfg(feature = "register-times")]
                 time_stereo_match,
+                img_left: None,
+                img_right: None,
             },
-        )
+        ))
     }
 
     /// Constructor for RGB-D cameras.
@@ -484,8 +494,8 @@ impl Frame {
         th_depth: f32,
         camera: Arc<dyn GeometricCamera>,
         prev_frame: Option<Arc<Frame>>,
-        imu_calib: Calib,
-    ) -> Self {
+        imu_calib: Arc<Calib>, // default to default constructor
+    ) -> Option<Self> {
         #[cfg(feature = "register-times")]
         let time_start_ext_orb = std::time::Instant::now();
 
@@ -497,6 +507,9 @@ impl Frame {
         let keys = res.keypoints;
         let descriptors = res.descriptors.unwrap_or_default();
         let n = keys.len();
+        if n == 0 {
+            return None;
+        }
 
         let keys_un =
             undistort_keypoints(&constants.dist_coef, &camera.to_k(), &constants.k, &keys);
@@ -507,7 +520,7 @@ impl Frame {
         let (grid, grid_right) =
             assign_features_to_grid(n, None, &keys, None, Some(&keys_un), &constants.bounds);
 
-        Self::assemble(
+        Some(Self::assemble(
             FrameConfig {
                 orb_vocabulary,
                 extractor_left: extractor.clone(),
@@ -546,8 +559,10 @@ impl Frame {
                 time_orb_ext,
                 #[cfg(feature = "register-times")]
                 time_stereo_match: 0.0,
+                img_left: None,
+                img_right: None,
             },
-        )
+        ))
     }
 
     /// Constructor for monocular cameras.
@@ -562,8 +577,8 @@ impl Frame {
         th_depth: f32,
         camera: Arc<dyn GeometricCamera>,
         prev_frame: Option<Arc<Frame>>,
-        imu_calib: Calib,
-    ) -> Self {
+        imu_calib: Arc<Calib>, // default to default constructor
+    ) -> Option<Self> {
         #[cfg(feature = "register-times")]
         let time_start_ext_orb = std::time::Instant::now();
 
@@ -575,6 +590,9 @@ impl Frame {
         let keys = res.keypoints;
         let descriptors = res.descriptors.unwrap_or_default();
         let n = keys.len();
+        if n == 0 {
+            return None;
+        }
 
         let keys_un =
             undistort_keypoints(&constants.dist_coef, &camera.to_k(), &constants.k, &keys);
@@ -587,7 +605,7 @@ impl Frame {
         let (grid, grid_right) =
             assign_features_to_grid(n, None, &keys, None, Some(&keys_un), &constants.bounds);
 
-        Self::assemble(
+        Some(Self::assemble(
             FrameConfig {
                 orb_vocabulary,
                 extractor_left: extractor.clone(),
@@ -626,8 +644,10 @@ impl Frame {
                 time_orb_ext,
                 #[cfg(feature = "register-times")]
                 time_stereo_match: 0.0,
+                img_left: None,
+                img_right: None,
             },
-        )
+        ))
     }
 
     /// Constructor for two-camera stereo fisheye (Kannala-Brandt) rigs.
@@ -649,8 +669,11 @@ impl Frame {
         camera2: Arc<dyn GeometricCamera>,
         t_lr: Isometry3<f32>,
         prev_frame: Option<Arc<Frame>>,
-        imu_calib: Calib,
-    ) -> Self {
+        imu_calib: Arc<Calib>,
+    ) -> Option<Self> {
+        let img_left = im_left.clone();
+        let img_right = im_right.clone();
+
         let lap_left = lapping_area(camera.as_ref());
         let lap_right = lapping_area(camera2.as_ref());
 
@@ -677,6 +700,9 @@ impl Frame {
         let n_left = keys.len();
         let n_right = keys_right.len();
         let n = n_left + n_right;
+        if n == 0 {
+            return None;
+        }
         let mono_left = left_res.mono_index.max(0) as usize;
         let mono_right = right_res.mono_index.max(0) as usize;
 
@@ -719,7 +745,7 @@ impl Frame {
             &constants.bounds,
         );
 
-        Self::assemble(
+        Some(Self::assemble(
             FrameConfig {
                 orb_vocabulary,
                 extractor_left,
@@ -758,8 +784,10 @@ impl Frame {
                 time_orb_ext,
                 #[cfg(feature = "register-times")]
                 time_stereo_match,
+                img_left: Some(img_left),
+                img_right: Some(img_right),
             },
-        )
+        ))
     }
 
     /// Merge the shared config and the sensor-specific feature data into a
@@ -850,6 +878,8 @@ impl Frame {
             has_velocity,
             is_set: false,
             is_imu_preintegrated: AtomicFlag::new(false),
+            img_left: ext.img_left,
+            img_right: ext.img_right,
         }
     }
 

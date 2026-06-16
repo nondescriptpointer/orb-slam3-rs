@@ -20,7 +20,7 @@ use opencv::{
     core::{ALGO_HINT_DEFAULT, CV_32F, Mat, MatExprTraitConst, Point2f, Point3f, Scalar},
     imgproc::ColorConversionCodes,
 };
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tracing::{info, warn};
 
 pub struct Tracking {
@@ -131,7 +131,7 @@ pub struct Tracking {
 
     // Drawers
     // TODO: others
-    #[cfg(feature = "viewer")]
+    #[cfg(feature = "viewer")] // TODO: is this really viewer only functionality?
     step_by_step: bool,
 
     // Atlas
@@ -616,7 +616,25 @@ impl Tracking {
     }
 
     // Main tracking function. It is independent of the input sensor
-    fn track(&mut self) {}
+    fn track(&mut self) {
+        #[cfg(feature = "viewer")]
+        if self.step_by_step {
+            info!("Tracking: Waiting to the next step");
+            while !self.step && self.step_by_step {
+                std::thread::sleep(Duration::from_micros(500));
+            }
+            self.step = false;
+        }
+
+        if let Some(local_mapper) = &self.local_mapper {
+            if true {
+                info!("RACK: Reset map because local mapper set the bad imu flag");
+                // TODO: call rest_active_map on system
+            }
+        }
+
+        // TODO
+    }
 
     #[cfg(feature = "register-times")]
     pub fn local_map_stats_to_file(&self) {

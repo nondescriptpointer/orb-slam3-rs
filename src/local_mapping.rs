@@ -70,7 +70,7 @@ struct StopState {
     not_stop: bool,
 }
 
-/// IMU-initialization parameters and statistics (upstream `mMutexImuInit`).
+/// IMU-initialization parameters and statistics
 /// Only touched by the local-mapping thread inside `initialize_imu` /
 /// `scale_refinement` / `run`, but guarded so cross-thread readers stay sound.
 struct ImuInitState {
@@ -242,7 +242,48 @@ impl LocalMapping {
 
     // Main function
     pub fn run(&self) {
-        // TODO: port the local-mapping loop.
+        self.finish.lock().unwrap().finished = true;
+
+        loop {
+            // tracking will see that local mapping is busy
+            self.set_accept_key_frames(false);
+
+            // check if there are keyframes in the queue
+            if self.check_new_key_frames() && !self.bad_imu.load(Ordering::SeqCst) {
+                #[cfg(feature = "register-times")]
+                let time_lba_ms = 0;
+                #[cfg(feature = "register-times")]
+                let time_kf_culling_ms = 0;
+
+                #[cfg(feature = "register-times")]
+                let time_start = std::time::Instant::now();
+
+                self.process_new_key_frame();
+
+                #[cfg(feature = "register-times")]
+                {
+                    self.register_times
+                        .lock()
+                        .unwrap()
+                        .kf_insert_ms
+                        .push(time_start.elapsed().as_secs_f64() * 1000.);
+                }
+
+                #[cfg(feature = "register-times")]
+                let time_start = std::time::Instant::now();
+
+                self.map_point_culling();
+
+                #[cfg(feature = "register-times")]
+                {
+                    self.register_times
+                        .lock()
+                        .unwrap()
+                        .mp_culling_ms
+                        .push(time_start.elapsed().as_secs_f64() * 1000.);
+                }
+            }
+        }
     }
 
     /// Enqueue a keyframe and request BA abort (upstream `InsertKeyFrame`).

@@ -148,7 +148,7 @@ pub struct KeyFrame {
     pub left_to_right_match: Option<Vec<usize>>,
     pub right_to_left_match: Option<Vec<usize>>,
 
-    pub imu_calib: Calib,
+    pub imu_calib: Arc<Calib>,
     pub imu_preintegrated: Option<Arc<Preintegrated>>,
 
     pub origin_map_id: u32,
@@ -963,7 +963,7 @@ impl KeyFrame {
             grid_right: self.grid_right.clone(),
             left_to_right_match: self.left_to_right_match.clone(),
             right_to_left_match: self.right_to_left_match.clone(),
-            imu_calib: self.imu_calib.clone(),
+            imu_calib: (*self.imu_calib).clone(),
             imu_preintegrated: self.imu_preintegrated.as_deref().cloned(),
             origin_map_id: self.origin_map_id,
             name_file: self.name_file.clone(),
@@ -1051,7 +1051,7 @@ impl KeyFrame {
             grid_right: b.grid_right.clone(),
             left_to_right_match: b.left_to_right_match.clone(),
             right_to_left_match: b.right_to_left_match.clone(),
-            imu_calib: b.imu_calib.clone(),
+            imu_calib: Arc::new(b.imu_calib.clone()),
             imu_preintegrated: b.imu_preintegrated.clone().map(Arc::new),
             origin_map_id: b.origin_map_id,
             name_file: b.name_file.clone(),

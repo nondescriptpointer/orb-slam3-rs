@@ -131,8 +131,9 @@ pub(crate) fn build_frame_from(img: &Mat) -> Frame {
         TH_DEPTH,
         camera(),
         None,
-        make_calib(),
+        Arc::new(make_calib()),
     )
+    .unwrap()
 }
 
 pub(crate) fn build_frame() -> Frame {

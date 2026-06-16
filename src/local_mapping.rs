@@ -1,4 +1,4 @@
-use nalgebra::{DMatrix, Matrix3};
+use nalgebra::{Matrix3, SMatrix};
 use std::sync::Arc;
 
 use crate::{
@@ -7,7 +7,6 @@ use crate::{
 };
 
 pub struct LocalMapping {
-    pub cov_inertial: DMatrix<f32>,
     pub rwg: Matrix3<f64>,
     pub bg: Matrix3<f64>,
     pub ba: Matrix3<f64>,
@@ -29,8 +28,6 @@ pub struct LocalMapping {
     pub not_ba1: bool,
     pub not_ba2: bool,
     pub bad_imu: bool,
-
-    pub write_stats: bool,
 
     // not considered far points (clouds)
     pub far_points: bool,
@@ -71,18 +68,18 @@ pub struct LocalMapping {
 
     reset_requested: bool,
     reset_requested_active_map: bool,
-    map_to_reset: Arc<Map>,
+    map_to_reset: Option<Arc<Map>>,
 
     finished_requested: bool,
     finished: bool,
 
     atlas: Arc<Atlas>,
 
-    loop_closer: Arc<LoopClosing>,
-    tracking: Arc<Tracking>,
+    loop_closer: Option<Arc<LoopClosing>>,
+    tracking: Option<Arc<Tracking>>,
 
     new_key_frames: Vec<Arc<KeyFrame>>,
-    current_key_frame: Arc<KeyFrame>,
+    current_key_frame: Option<Arc<KeyFrame>>,
 
     recent_added_map_points: Vec<Arc<MapPoint>>,
 
@@ -96,10 +93,93 @@ pub struct LocalMapping {
 
     initializing: bool,
 
-    info_inertial: DMatrix<f64>,
+    info_inertial: SMatrix<f64, 9, 9>,
     num_lm: usize,
     num_kf_culling: usize,
 
     t_init: f32,
-    count_refinement: usize,
+}
+
+impl LocalMapping {
+    fn new(
+        system: Arc<System>,
+        atlas: Arc<Atlas>,
+        monocular: bool,
+        inertial: bool,
+        sequence: String,
+    ) -> Self {
+        LocalMapping {
+            rwg: Matrix3::identity(),
+            bg: Matrix3::identity(),
+            ba: Matrix3::identity(),
+            scale: 1.,
+            init_time: 0.,
+            cost_time: 0.,
+            init_sect: 0,
+            idx_init: 0,
+            n_kfs: 0,
+            first_ts: 0.,
+            matches_inliers: 0,
+            init_fr: 0,
+            idx_iteration: 0,
+            sequence,
+            not_ba1: true,
+            not_ba2: true,
+            bad_imu: false,
+            far_points: false, // forced off in the C++ code
+            th_far_points: 0., // forced off in the C++ code
+            #[cfg(feature = "register-times")]
+            kf_insert_ms: Vec::new(),
+            #[cfg(feature = "register-times")]
+            mp_culling_ms: Vec::new(),
+            #[cfg(feature = "register-times")]
+            mp_creation_ms: Vec::new(),
+            #[cfg(feature = "register-times")]
+            lba_ms: Vec::new(),
+            #[cfg(feature = "register-times")]
+            kf_culling_ms: Vec::new(),
+            #[cfg(feature = "register-times")]
+            lm_total_ms: Vec::new(),
+            #[cfg(feature = "register-times")]
+            lba_sync_ms: Vec::new(),
+            #[cfg(feature = "register-times")]
+            kf_culling_sync_ms: Vec::new(),
+            #[cfg(feature = "register-times")]
+            lba_edges: Vec::new(),
+            #[cfg(feature = "register-times")]
+            lba_kf_opt: Vec::new(),
+            #[cfg(feature = "register-times")]
+            lba_kf_fixed: Vec::new(),
+            #[cfg(feature = "register-times")]
+            lba_mps: Vec::new(),
+            #[cfg(feature = "register-times")]
+            lba_exec: 0,
+            #[cfg(feature = "register-times")]
+            lba_abort: 0,
+            system,
+            monocular,
+            inertial,
+            reset_requested: false,
+            reset_requested_active_map: false,
+            map_to_reset: None,
+            finished_requested: false,
+            finished: true,
+            atlas,
+            loop_closer: None,
+            tracking: None,
+            new_key_frames: Vec::new(),
+            current_key_frame: None,
+            recent_added_map_points: Vec::new(),
+            abort_ba: false,
+            stopped: false,
+            stop_requested: false,
+            not_stop: false,
+            accept_key_frames: true,
+            initializing: false,
+            info_inertial: SMatrix::zeros(),
+            num_lm: 0,
+            num_kf_culling: 0,
+            t_init: 0.,
+        }
+    }
 }

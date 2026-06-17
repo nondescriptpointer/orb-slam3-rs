@@ -22,6 +22,10 @@ This translation was largely not vibe coded except some automatic translation of
 
 [DBoW2 Place Recognition] Dorian Gálvez-López and Juan D. Tardós. **Bags of Binary Words for Fast Place Recognition in Image Sequences**. _IEEE Transactions on Robotics,_ vol. 28, no. 5, pp. 1188-1197, 2012. **[PDF](http://doriangalvez.com/php/dl.php?dlp=GalvezTRO12.pdf)**
 
+### Alternatives
+
+For a newer greenfield, more permissively licensed Rust visual SLAM solution have a look at [visloc-rs](https://github.com/rsasaki0109/visloc-rs) which shows great promise.
+
 # 1. License
 
 orb-slam3-rs is, like the C++ source, released under GPLv3 license.

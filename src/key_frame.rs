@@ -170,6 +170,17 @@ pub struct KeyFrame {
     map: RwLock<Weak<Map>>,
     prev_kf: RwLock<Weak<KeyFrame>>,
     next_kf: RwLock<Weak<KeyFrame>>,
+    /// Global-BA staging (set by `Optimizer::global_bundle_adjustment` for the
+    /// loop-closing path; mirrors C++ `mTcwGBA` / `mnBAGlobalForKF`). Not
+    /// serialized.
+    gba: RwLock<KfGba>,
+}
+
+/// Global-BA staging for a keyframe.
+#[derive(Clone, Default)]
+struct KfGba {
+    tcw_gba: Option<Isometry3<f32>>,
+    mn_ba_global_for_kf: i64,
 }
 
 impl PartialEq for KeyFrame {
@@ -277,6 +288,7 @@ impl KeyFrame {
             map: RwLock::new(Arc::downgrade(&map)),
             prev_kf: RwLock::new(Weak::new()),
             next_kf: RwLock::new(Weak::new()),
+            gba: RwLock::new(KfGba::default()),
         };
 
         let kf = Arc::new(kf);
@@ -320,6 +332,22 @@ impl KeyFrame {
 
     pub fn get_pose(&self) -> Isometry3<f32> {
         self.pose.read().unwrap().tcw
+    }
+
+    /// Store global-BA result without applying it (loop-closing path):
+    /// `mTcwGBA` + `mnBAGlobalForKF`.
+    pub fn set_tcw_gba(&self, tcw_gba: Isometry3<f32>, loop_kf: i64) {
+        let mut g = self.gba.write().unwrap();
+        g.tcw_gba = Some(tcw_gba);
+        g.mn_ba_global_for_kf = loop_kf;
+    }
+    /// Read the staged global-BA pose, if any.
+    pub fn get_tcw_gba(&self) -> Option<Isometry3<f32>> {
+        self.gba.read().unwrap().tcw_gba
+    }
+    /// Read `mnBAGlobalForKF`.
+    pub fn get_ba_global_for_kf(&self) -> i64 {
+        self.gba.read().unwrap().mn_ba_global_for_kf
     }
     pub fn get_pose_inverse(&self) -> Isometry3<f32> {
         self.pose.read().unwrap().twc
@@ -1083,6 +1111,7 @@ impl KeyFrame {
             map: RwLock::new(Weak::new()),
             prev_kf: RwLock::new(Weak::new()),
             next_kf: RwLock::new(Weak::new()),
+            gba: RwLock::new(KfGba::default()),
         };
         let kf = Arc::new(kf);
         kf.set_pose(b.tcw);

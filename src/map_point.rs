@@ -112,6 +112,16 @@ pub struct MapPoint {
     // Weak back-pointer: the owning `Map` strongly holds this point, so a strong
     // ref here would form an `Arc` cycle and leak the whole map.
     map: RwLock<Weak<Map>>,
+    /// Global-BA staging (loop-closing path); mirrors C++ `mPosGBA` /
+    /// `mnBAGlobalForKF`. Not serialized.
+    gba: RwLock<MpGba>,
+}
+
+/// Global-BA staging for a map point.
+#[derive(Clone, Default)]
+struct MpGba {
+    pos_gba: Option<Vector3<f32>>,
+    mn_ba_global_for_kf: i64,
 }
 
 impl PartialEq for MapPoint {
@@ -178,7 +188,23 @@ impl MapPoint {
                 replaced: None,
             }),
             map: RwLock::new(map.as_ref().map(Arc::downgrade).unwrap_or_default()),
+            gba: RwLock::new(MpGba::default()),
         }
+    }
+
+    /// Store global-BA result without applying it: `mPosGBA` + `mnBAGlobalForKF`.
+    pub fn set_pos_gba(&self, pos_gba: Vector3<f32>, loop_kf: i64) {
+        let mut g = self.gba.write().unwrap();
+        g.pos_gba = Some(pos_gba);
+        g.mn_ba_global_for_kf = loop_kf;
+    }
+    /// Read the staged global-BA position, if any.
+    pub fn get_pos_gba(&self) -> Option<Vector3<f32>> {
+        self.gba.read().unwrap().pos_gba
+    }
+    /// Read `mnBAGlobalForKF`.
+    pub fn get_ba_global_for_kf(&self) -> i64 {
+        self.gba.read().unwrap().mn_ba_global_for_kf
     }
 
     /// Default-constructed map point (no position, no reference).

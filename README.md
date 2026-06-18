@@ -2,7 +2,9 @@
 
 Rust reimplementation of [ORB-SLAM3](https://github.com/UZ-SLAMLab/ORB_SLAM3). The original C++ ORB-SLAM3 is currently unmaintained and hard to build on newer systems while still being the most used reference for realtime SLAM. This project aims to provide an easier way to run and integrate ORB-SLAM3 into your projects. It follows C++ codebase relatively closely while trying to be as Rust idiomatic as possible and does aim to introduce some improvements: fixes for various segfaults the C++ codebase is sensitive to, multithreading improvements, bugfixes based on pull requests and small performance improvements.
 
-This translation was largely not vibe coded except some automatic translation of long math-heavy classes, comments and some of the unit tests to validate parity with the C++ codebase.
+For the optimizer the required slice of [g2o](https://github.com/RainerKuemmerle/g2o) functionality was ported to be contained within this implementation.
+
+AI transparency: Significant parts of this port, especially the more complex mathematical code such as the optimizer and some unit tests for validating parity with the original C++ codebase, were written with the help of LLM tools. My understanding of the underlying math is limited, and correctness has only been validated empirically against the C++ implementation.
 
 **Original authors:** Carlos Campos, Richard Elvira, Juan J. Gómez Rodríguez, [José M. M. Montiel](http://webdiis.unizar.es/~josemari/), [Juan D. Tardos](http://webdiis.unizar.es/~jdtardos/).
 

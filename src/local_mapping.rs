@@ -192,15 +192,13 @@ pub struct LocalMapping {
 
     // --- lock-free signals (intentionally racy in upstream) ---------------
     /// BA abort flag — the optimizer polls this to bail out early
-    /// (upstream `mbAbortBA`, a bare `bool*`).
-    abort_ba: AtomicBool,
-    /// Whether new keyframes are currently accepted (upstream `mMutexAccept`).
-    accept_key_frames: AtomicBool,
-    /// IMU initialization in progress (upstream `bInitializing`).
-    initializing: AtomicBool,
+    abort_ba: Arc<AtomicBool>,
+    /// Whether new keyframes are currently accepted
+    accept_key_frames: Arc<AtomicBool>,
+    /// IMU initialization in progress
+    initializing: Arc<AtomicBool>,
     /// Bad-IMU flag polled by `Tracking` to request a map reset
-    /// (upstream `mbBadImu`).
-    bad_imu: AtomicBool,
+    bad_imu: Arc<AtomicBool>,
 
     // --- locked state (see module-level lock ordering) --------------------
     /// New-keyframe queue (upstream `mMutexNewKFs` / `mlNewKeyFrames`).
@@ -237,10 +235,10 @@ impl LocalMapping {
             th_far_points: 0., // forced off in the C++ code
             loop_closer: OnceLock::new(),
             tracker: OnceLock::new(),
-            abort_ba: AtomicBool::new(false),
-            accept_key_frames: AtomicBool::new(true),
-            initializing: AtomicBool::new(false),
-            bad_imu: AtomicBool::new(false),
+            abort_ba: Arc::new(AtomicBool::new(false)),
+            accept_key_frames: Arc::new(AtomicBool::new(true)),
+            initializing: Arc::new(AtomicBool::new(false)),
+            bad_imu: Arc::new(AtomicBool::new(false)),
             new_key_frames: Mutex::new(VecDeque::new()),
             current_key_frame: Mutex::new(None),
             recent_added_map_points: Mutex::new(Vec::new()),
@@ -295,23 +293,17 @@ impl LocalMapping {
                     }
                 });
 
-                let mut done_lba = false;
-                let mut fixed_kf_ba = 0;
-                let mut opt_kf_ba = 0;
-                let mut mps_ba = 0;
-                let mut edged_ba = 0;
-
                 if !self.check_new_key_frames()
                     && !self.stop_requested()
                     && let Some(current_keyframe) = self.current_key_frame.lock().unwrap().as_ref()
                 {
                     if let Some(key_frames) = self.atlas.key_frames_in_map()
                         && key_frames > 2
+                        && let Some(map) = current_keyframe.get_map()
                     {
-                        if self.inertial
-                            && let Some(map) = current_keyframe.get_map()
-                            && map.is_imu_initialized()
-                        {
+                        #[cfg(feature = "register-times")]
+                        let start = std::time::Instant::now();
+                        let result = if self.inertial && map.is_imu_initialized() {
                             if let Some(previous_kf) = current_keyframe.get_prev_kf()
                                 && let Some(previous_previous_kf) = previous_kf.get_prev_kf()
                             {
@@ -342,23 +334,50 @@ impl LocalMapping {
                                 let inliers = self.tracker.get().unwrap().get_matches_inliers();
                                 let large = ((inliers > 75) && self.monocular)
                                     || ((inliers > 100) && !self.monocular);
-                                optimizer::local_inertial_ba(
+                                Some(optimizer::local_inertial_ba(
                                     current_keyframe,
-                                    None,
+                                    Some(self.abort_ba.clone()),
                                     &map,
                                     large,
                                     false,
-                                );
-
-                                done_lba = true;
+                                ))
+                            } else {
+                                None
                             }
+                        } else if let Some(map) = current_keyframe.get_map() {
+                            Some(optimizer::local_bundle_adjustment(
+                                current_keyframe,
+                                Some(self.abort_ba.clone()),
+                                &map,
+                            ))
                         } else {
-                            // TODO: Optimizer
-                            done_lba = true;
+                            None
+                        };
+                        #[cfg(feature = "register-times")]
+                        if let Some(result) = result {
+                            let duration = start.elapsed().as_secs_f64() * 1000.;
+                            let mut register = self.register_times.lock().unwrap();
+                            register.lba_ms.push(duration);
+                            register.lba_exec += 1;
+                            if self.abort_ba.load(Ordering::SeqCst) {
+                                register.lba_abort += 1;
+                            }
+                            register.lba_kf_fixed.push(result.0);
+                            register.lba_kf_opt.push(result.1);
+                            register.lba_mps.push(result.2);
+                            register.lba_edges.push(result.3);
                         }
                     }
 
-                    // TODO
+                    // Initialize the IMU here
+                    if let Some(map) = current_keyframe.get_map()
+                        && !map.is_imu_initialized()
+                        && self.inertial
+                    {
+                        if self.monocular {
+                        } else {
+                        }
+                    }
                 }
                 // TODO
             }

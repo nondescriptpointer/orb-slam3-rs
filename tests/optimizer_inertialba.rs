@@ -163,7 +163,8 @@ fn inertial_ba_matches_g2o() {
     let ref_states: Vec<ImuState> = (0..n_kf).map(|_| t.state()).collect();
     let ref_points: Vec<Vector3<f64>> = (0..n_pts).map(|_| t.v3()).collect();
 
-    let (states, pts) = inertial_ba_core(&kfs, &links, &points, &obs, 10, 1e-5);
+    let res = inertial_ba_core(&kfs, &links, &points, &obs, 10, 1e-5, None);
+    let (states, pts) = (res.states, res.points);
 
     for (i, (g, r)) in states.iter().zip(ref_states.iter()).enumerate() {
         let dr = (g.rwb.transpose() * r.rwb).into();

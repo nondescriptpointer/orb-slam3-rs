@@ -1411,6 +1411,167 @@ pub fn inertial_optimization_gs_core(
     (r.rwg, r.scale)
 }
 
+/// `Optimizer::LocalBundleAdjustment` 2nd overload (Optimizer.cc:3498): the
+/// merge-welding visual BA. `adjust_kfs` are optimized, `fixed_kfs` held fixed,
+/// over the map points observed by `main_kf`; outliers are culled.
+pub fn local_bundle_adjustment_merge(
+    main_kf: &Arc<KeyFrame>,
+    adjust_kfs: &[Arc<KeyFrame>],
+    fixed_kfs: &[Arc<KeyFrame>],
+    stop_flag: Option<Arc<AtomicBool>>,
+) {
+    let Some(map) = main_kf.get_map() else { return };
+    let mut optimizer = SparseOptimizer::new();
+    if let Some(f) = stop_flag {
+        optimizer.set_force_stop_flag(f);
+    }
+
+    let th_huber_2d = 5.99_f64.sqrt();
+    let th_huber_3d = 7.815_f64.sqrt();
+
+    let mut kf_vertex: HashMap<u64, usize> = HashMap::new();
+    let mut adjust_arcs: Vec<Arc<KeyFrame>> = Vec::new();
+    for kf in adjust_kfs {
+        if kf.is_bad() {
+            continue;
+        }
+        let v = VertexSE3Expmap::new(SE3Quat::from_isometry_f32(&kf.get_pose()));
+        kf_vertex.insert(kf.id, optimizer.add_vertex(Box::new(v)));
+        adjust_arcs.push(kf.clone());
+    }
+    for kf in fixed_kfs {
+        if kf.is_bad() || kf_vertex.contains_key(&kf.id) {
+            continue;
+        }
+        let mut v = VertexSE3Expmap::new(SE3Quat::from_isometry_f32(&kf.get_pose()));
+        v.set_fixed(true);
+        kf_vertex.insert(kf.id, optimizer.add_vertex(Box::new(v)));
+    }
+
+    // Map points seen by the welding-area keyframes (main + adjust).
+    let mut mps: Vec<Arc<MapPoint>> = Vec::new();
+    let mut mp_seen: HashSet<usize> = HashSet::new();
+    for kf in std::iter::once(main_kf).chain(adjust_kfs.iter()) {
+        for mp in kf.get_map_point_matches().into_iter().flatten() {
+            if !mp.is_bad() && mp_seen.insert(mp.id) {
+                mps.push(mp);
+            }
+        }
+    }
+
+    struct Rec {
+        ei: usize,
+        thr: f64,
+        kf: Arc<KeyFrame>,
+        mp: Arc<MapPoint>,
+    }
+    let mut recs: Vec<Rec> = Vec::new();
+    let mut mp_vertex: HashMap<usize, usize> = HashMap::new();
+    for mp in &mps {
+        let mut v = VertexSBAPointXYZ::new(mp.get_world_pos().cast::<f64>());
+        v.set_marginalized(true);
+        let mp_vi = optimizer.add_vertex(Box::new(v));
+        mp_vertex.insert(mp.id, mp_vi);
+        for (obs_kf, (left, _r)) in mp.get_observations() {
+            let Some(&kf_vi) = kf_vertex.get(&obs_kf.id) else {
+                continue;
+            };
+            let left = left as i64;
+            if left < 0 {
+                continue;
+            }
+            let li = left as usize;
+            let kp = &obs_kf.keys_un[li];
+            let inv_sigma2 = obs_kf.inv_level_sigma2[kp.octave() as usize] as f64;
+            if obs_kf.u_right[li] < 0.0 {
+                let mut e = EdgeSE3ProjectXYZ::new(mp_vi, kf_vi, obs_kf.camera.clone());
+                e.set_measurement(Vector2::new(kp.pt().x as f64, kp.pt().y as f64));
+                e.set_information(Matrix2::identity() * inv_sigma2);
+                e.set_robust_kernel(Some(th_huber_2d));
+                let ei = optimizer.add_edge(Box::new(e));
+                recs.push(Rec {
+                    ei,
+                    thr: CHI2_MONO,
+                    kf: obs_kf.clone(),
+                    mp: mp.clone(),
+                });
+            } else {
+                let mut e = EdgeStereoSE3ProjectXYZ::new(
+                    mp_vi,
+                    kf_vi,
+                    obs_kf.fx as f64,
+                    obs_kf.fy as f64,
+                    obs_kf.cx as f64,
+                    obs_kf.cy as f64,
+                    obs_kf.bf as f64,
+                );
+                e.set_measurement(Vector3::new(
+                    kp.pt().x as f64,
+                    kp.pt().y as f64,
+                    obs_kf.u_right[li] as f64,
+                ));
+                e.set_information(Matrix3::identity() * inv_sigma2);
+                e.set_robust_kernel(Some(th_huber_3d));
+                let ei = optimizer.add_edge(Box::new(e));
+                recs.push(Rec {
+                    ei,
+                    thr: CHI2_STEREO,
+                    kf: obs_kf.clone(),
+                    mp: mp.clone(),
+                });
+            }
+        }
+    }
+
+    optimizer.initialize_optimization(0);
+    optimizer.optimize(5);
+
+    // Cull outliers, then re-optimize without them.
+    for rec in &recs {
+        if optimizer.edge(rec.ei).chi2() > rec.thr || !optimizer.edge_depth_positive(rec.ei) {
+            optimizer.edge_mut(rec.ei).set_level(1);
+        }
+    }
+    optimizer.initialize_optimization(0);
+    optimizer.optimize(10);
+
+    let mut to_erase: Vec<(Arc<KeyFrame>, Arc<MapPoint>)> = Vec::new();
+    for rec in &recs {
+        if optimizer.edge(rec.ei).chi2() > rec.thr || !optimizer.edge_depth_positive(rec.ei) {
+            to_erase.push((rec.kf.clone(), rec.mp.clone()));
+        }
+    }
+    for (ekf, emp) in &to_erase {
+        ekf.erase_map_point_match(emp);
+        emp.erase_observation(ekf);
+    }
+
+    for kf in &adjust_arcs {
+        let vi = kf_vertex[&kf.id];
+        let pose = optimizer
+            .vertex(vi)
+            .as_any()
+            .downcast_ref::<VertexSE3Expmap>()
+            .unwrap()
+            .estimate()
+            .to_isometry_f32();
+        kf.set_pose(pose);
+    }
+    for mp in &mps {
+        let vi = mp_vertex[&mp.id];
+        let pos = optimizer
+            .vertex(vi)
+            .as_any()
+            .downcast_ref::<VertexSBAPointXYZ>()
+            .unwrap()
+            .estimate()
+            .cast::<f32>();
+        mp.set_world_pos(pos);
+        mp.update_normal_and_depth();
+    }
+    map.increase_change_index();
+}
+
 // ===========================================================================
 // PoseInertialOptimizationLastKeyFrame
 // ===========================================================================
@@ -1476,6 +1637,191 @@ fn imu_cam_pose_full(
         tcw.push(rcb * tbw + tcb);
     }
     ImuCamPose::new(rcw, tcw, rbc.to_vec(), tbc.to_vec(), bf, cameras.to_vec())
+}
+
+/// Gather inertial pose-only observations from a frame (left mono / stereo;
+/// fisheye-rig right-camera observations are not yet gathered). Mirrors the
+/// per-keypoint branching in `PoseInertialOptimization*`.
+fn gather_inertial_pose_obs(frame: &Frame) -> Vec<InertialPoseObs> {
+    let mut obs = Vec::with_capacity(frame.n);
+    let has_rig = frame.camera2.is_some();
+    let n_left = frame.n_left.unwrap_or(0);
+    for i in 0..frame.n {
+        let Some(mp) = frame.map_points[i].clone() else {
+            continue;
+        };
+        let xw = mp.get_world_pos().cast::<f64>();
+        let td = mp.track_depth;
+        if has_rig && i >= n_left {
+            continue; // rig right-camera path not yet gathered
+        }
+        let kp = &frame.keys_un.as_ref().unwrap_or(&frame.keys)[i];
+        let inv_sigma2 = frame.inv_level_sigma2[kp.octave() as usize] as f64;
+        let o = Vector2::new(kp.pt().x as f64, kp.pt().y as f64);
+        let unc2 = frame.camera.uncertainty(&o) as f64;
+        let inv_sigma2 = inv_sigma2 / unc2;
+        if frame.u_right[i] < 0.0 {
+            obs.push(InertialPoseObs::Mono {
+                xw,
+                obs: o,
+                inv_sigma2,
+                track_depth: td,
+                cam_idx: 0,
+                idx: i,
+            });
+        } else {
+            obs.push(InertialPoseObs::Stereo {
+                xw,
+                obs: Vector3::new(o[0], o[1], frame.u_right[i] as f64),
+                inv_sigma2,
+                cam_idx: 0,
+                idx: i,
+            });
+        }
+    }
+    obs
+}
+
+fn imu_state_from_frame(frame: &Frame) -> ImuState {
+    let b = frame.imu_bias;
+    ImuState {
+        rwb: frame.get_imu_rotation().cast::<f64>(),
+        twb: frame.get_imu_position().cast::<f64>(),
+        vel: frame.get_velocity().cast::<f64>(),
+        bg: Vector3::new(b.bwx as f64, b.bwy as f64, b.bwz as f64),
+        ba: Vector3::new(b.bax as f64, b.bay as f64, b.baz as f64),
+    }
+}
+
+fn frame_extrinsics(frame: &Frame) -> (nalgebra::Matrix3<f64>, Vector3<f64>) {
+    let rbc = frame
+        .imu_calib
+        .tbc
+        .rotation
+        .to_rotation_matrix()
+        .into_inner()
+        .cast::<f64>();
+    let tbc = frame.imu_calib.tbc.translation.vector.cast::<f64>();
+    (rbc, tbc)
+}
+
+fn apply_pose_inertial_result(frame: &mut Frame, res: &PoseInertialResult) {
+    frame.set_imu_pose_velocity(
+        res.state.rwb.cast::<f32>(),
+        res.state.twb.cast::<f32>(),
+        res.state.vel.cast::<f32>(),
+    );
+    frame.imu_bias = Bias::from_params(
+        res.state.ba[0] as f32,
+        res.state.ba[1] as f32,
+        res.state.ba[2] as f32,
+        res.state.bg[0] as f32,
+        res.state.bg[1] as f32,
+        res.state.bg[2] as f32,
+    );
+    for &(idx, is_out) in &res.outliers {
+        frame.outlier[idx] = is_out;
+    }
+    frame.cpi = Some(res.prior.clone());
+}
+
+/// `Optimizer::PoseInertialOptimizationLastKeyFrame` (Optimizer.cc:4491):
+/// inertial pose tracking against the last keyframe. Updates the frame's pose,
+/// velocity, bias, outlier flags and prior; returns the inlier count.
+pub fn pose_inertial_optimization_last_keyframe(frame: &mut Frame, b_rec_init: bool) -> i32 {
+    let Some(last_kf) = frame.last_keyframe.clone() else {
+        return 0;
+    };
+    let Some(preint) = frame.imu_preintegrated.clone() else {
+        return 0;
+    };
+    let cur = imu_state_from_frame(frame);
+    let lb = last_kf.get_imu_bias();
+    let last = ImuState {
+        rwb: last_kf.get_imu_rotation().cast::<f64>(),
+        twb: last_kf.get_imu_position().cast::<f64>(),
+        vel: last_kf.get_velocity().cast::<f64>(),
+        bg: Vector3::new(lb.bwx as f64, lb.bwy as f64, lb.bwz as f64),
+        ba: Vector3::new(lb.bax as f64, lb.bay as f64, lb.baz as f64),
+    };
+    let (rbc, tbc) = frame_extrinsics(frame);
+    let bf = frame.b_fx as f64;
+    let camera = frame.camera.clone();
+    let obs = gather_inertial_pose_obs(frame);
+
+    let res = pose_inertial_optimization_last_kf_core(
+        &cur,
+        &last,
+        preint,
+        &obs,
+        &[camera],
+        &[rbc],
+        &[tbc],
+        bf,
+        b_rec_init,
+    );
+    let n = res.n_inliers;
+    apply_pose_inertial_result(frame, &res);
+    n
+}
+
+/// `Optimizer::PoseInertialOptimizationLastFrame` (Optimizer.cc:4875): inertial
+/// pose tracking against the previous frame (constrained by its prior). Updates
+/// the current frame and returns the inlier count.
+pub fn pose_inertial_optimization_last_frame(frame: &mut Frame, b_rec_init: bool) -> i32 {
+    let Some(prev_frame) = frame.prev_frame.clone() else {
+        return 0;
+    };
+    let Some(preint) = frame.imu_preintegrated_frame.clone() else {
+        return 0;
+    };
+    let Some(prev_cpi) = prev_frame.cpi.clone() else {
+        return 0;
+    };
+    // Bias random-walk info comes from the keyframe preintegration.
+    let kf_preint = frame
+        .imu_preintegrated
+        .clone()
+        .unwrap_or_else(|| preint.clone());
+    let info_g: nalgebra::Matrix3<f64> = kf_preint
+        .c
+        .fixed_view::<3, 3>(9, 9)
+        .into_owned()
+        .cast::<f64>()
+        .try_inverse()
+        .unwrap();
+    let info_a: nalgebra::Matrix3<f64> = kf_preint
+        .c
+        .fixed_view::<3, 3>(12, 12)
+        .into_owned()
+        .cast::<f64>()
+        .try_inverse()
+        .unwrap();
+
+    let cur = imu_state_from_frame(frame);
+    let prev = imu_state_from_frame(&prev_frame);
+    let (rbc, tbc) = frame_extrinsics(frame);
+    let bf = frame.b_fx as f64;
+    let camera = frame.camera.clone();
+    let obs = gather_inertial_pose_obs(frame);
+
+    let res = pose_inertial_optimization_last_frame_core(
+        &cur,
+        &prev,
+        preint,
+        info_g,
+        info_a,
+        &prev_cpi,
+        &obs,
+        &[camera],
+        &[rbc],
+        &[tbc],
+        bf,
+        b_rec_init,
+    );
+    let n = res.n_inliers;
+    apply_pose_inertial_result(frame, &res);
+    n
 }
 
 /// Core of `Optimizer::PoseInertialOptimizationLastKeyFrame` (Optimizer.cc:4491).
@@ -2396,10 +2742,22 @@ fn imu_state_to_tcw(
 /// When `loop_kf == 0` the result is written back directly; otherwise keyframe
 /// poses / point positions are staged in their global-BA fields.
 ///
-/// The IMU-initialization variant (`bInit`, with a single shared bias vertex +
+/// The IMU-initialization variant (`b_init`, with a single shared bias vertex +
 /// bias priors) is not yet wired here; the underlying [`inertial_ba_core`]
-/// already validates the shared per-keyframe-bias numerics.
-pub fn full_inertial_ba(map: &Map, iterations: i32, loop_kf: u64, b_fix_local: bool) {
+/// already validates the shared per-keyframe-bias numerics. (`vSingVal`/`bHess`
+/// in the C++ signature are dead outputs and are omitted.)
+#[allow(clippy::too_many_arguments)]
+pub fn full_inertial_ba(
+    map: &Map,
+    iterations: i32,
+    b_fix_local: bool,
+    loop_kf: u64,
+    stop_flag: Option<Arc<AtomicBool>>,
+    b_init: bool,
+    _prior_g: f32,
+    _prior_a: f32,
+) {
+    let _ = b_init; // shared-bias init path not yet wired (see doc).
     let kfs_all = map.get_all_key_frames();
     let mps_all = map.get_all_map_points();
     let max_kf_id = map.get_max_kf_id();
@@ -2491,7 +2849,7 @@ pub fn full_inertial_ba(map: &Map, iterations: i32, loop_kf: u64, b_fix_local: b
         }
     }
 
-    let r = inertial_ba_core(&kfs, &links, &points, &obs, iterations, 1e-5, None);
+    let r = inertial_ba_core(&kfs, &links, &points, &obs, iterations, 1e-5, stop_flag);
     let (states, out_points) = (r.states, r.points);
 
     let direct = loop_kf == 0;
@@ -2786,6 +3144,138 @@ pub fn optimize_essential_graph_4dof_core(
         .collect()
 }
 
+/// `Optimizer::OptimizeEssentialGraph4DoF` (Optimizer.cc:5292): the inertial
+/// loop-closing yaw+translation pose graph over `&Map`, built from the
+/// (non-)corrected Sim3 maps + keyframe poses, optimized via
+/// [`optimize_essential_graph_4dof_core`], then recovered to SE3 keyframe poses
+/// and applied to the map points.
+pub fn optimize_essential_graph_4dof(
+    map: &Map,
+    loop_kf: &Arc<KeyFrame>,
+    cur_kf: &Arc<KeyFrame>,
+    non_corrected: &KeyFrameAndPose,
+    corrected: &KeyFrameAndPose,
+    loop_connections: &LoopConnections,
+) {
+    const MIN_FEAT: i32 = 100;
+    let init_kf_id = map.get_init_kf_id();
+    let mut kfs = map.get_all_key_frames();
+    kfs.sort_by_key(|k| k.id);
+    let max_kf_id = map.get_max_kf_id();
+    kfs.retain(|k| k.id <= max_kf_id && !k.is_bad());
+    let idx: HashMap<u64, usize> = kfs.iter().enumerate().map(|(i, k)| (k.id, i)).collect();
+
+    // Per-keyframe Scw (corrected if available, else current pose).
+    let vscw: Vec<Sim3> = kfs
+        .iter()
+        .map(|k| {
+            corrected
+                .get(&k.id)
+                .copied()
+                .unwrap_or_else(|| sim3_from_pose(&k.get_pose()))
+        })
+        .collect();
+    let verts: Vec<Pose4DoF> = kfs
+        .iter()
+        .enumerate()
+        .map(|(i, k)| Pose4DoF {
+            rcw: vscw[i].rotation_matrix(),
+            tcw: vscw[i].translation(),
+            fixed: k.id == init_kf_id,
+        })
+        .collect();
+    let siw_for = |kf: &Arc<KeyFrame>| -> Sim3 {
+        non_corrected
+            .get(&kf.id)
+            .copied()
+            .unwrap_or(vscw[idx[&kf.id]])
+    };
+
+    let mut edges: Vec<Edge4DoFConstraint> = Vec::new();
+    let mut inserted: HashSet<(u64, u64)> = HashSet::new();
+    let key = |a: u64, b: u64| (a.min(b), a.max(b));
+    let rel = |si: &Sim3, sj: &Sim3| -> (nalgebra::Matrix3<f64>, Vector3<f64>) {
+        // Tij such that Edge4DoF error vanishes: drij = Rcw_i Rcw_jᵀ, dtij = tcw_i - drij tcw_j.
+        let (ri, ti) = (si.rotation_matrix(), si.translation());
+        let (rj, tj) = (sj.rotation_matrix(), sj.translation());
+        let drij = ri * rj.transpose();
+        (drij, ti - drij * tj)
+    };
+
+    for (&id_i, conns) in loop_connections.iter() {
+        let Some(&i) = idx.get(&id_i) else { continue };
+        let si = vscw[i];
+        for &id_j in conns {
+            let Some(&j) = idx.get(&id_j) else { continue };
+            if (id_i != cur_kf.id || id_j != loop_kf.id) && kfs[i].get_weight(&kfs[j]) < MIN_FEAT {
+                continue;
+            }
+            let (drij, dtij) = rel(&vscw[j], &si);
+            edges.push(Edge4DoFConstraint { i, j, drij, dtij });
+            inserted.insert(key(id_i, id_j));
+        }
+    }
+    for (i, kf) in kfs.iter().enumerate() {
+        let si = siw_for(kf);
+        if let Some(parent) = kf.get_parent() {
+            if let Some(&j) = idx.get(&parent.id) {
+                let (drij, dtij) = rel(&siw_for(&parent), &si);
+                edges.push(Edge4DoFConstraint { i, j, drij, dtij });
+            }
+        }
+        for lkf in kf.get_loop_edges() {
+            if lkf.id < kf.id {
+                if let Some(&j) = idx.get(&lkf.id) {
+                    let (drij, dtij) = rel(&siw_for(&lkf), &si);
+                    edges.push(Edge4DoFConstraint { i, j, drij, dtij });
+                }
+            }
+        }
+        for nkf in kf.get_covisibles_by_weight(MIN_FEAT) {
+            let is_parent = kf.get_parent().map(|p| p.id == nkf.id).unwrap_or(false);
+            if is_parent || kf.has_child(&nkf) || nkf.is_bad() || nkf.id >= kf.id {
+                continue;
+            }
+            if inserted.contains(&key(kf.id, nkf.id)) {
+                continue;
+            }
+            if let Some(&j) = idx.get(&nkf.id) {
+                let (drij, dtij) = rel(&siw_for(&nkf), &si);
+                edges.push(Edge4DoFConstraint { i, j, drij, dtij });
+            }
+        }
+    }
+
+    let out = optimize_essential_graph_4dof_core(&verts, &edges, 20);
+
+    let mut vcorrected_swc: Vec<Sim3> = Vec::with_capacity(kfs.len());
+    for (i, kf) in kfs.iter().enumerate() {
+        let (rcw, tcw) = out[i];
+        let csiw = Sim3::new(nalgebra::UnitQuaternion::from_matrix(&rcw), tcw, 1.0);
+        vcorrected_swc.push(csiw.inverse());
+        kf.set_pose(Isometry3::from_parts(
+            nalgebra::Translation3::from(tcw.cast::<f32>()),
+            nalgebra::UnitQuaternion::from_matrix(&rcw.cast::<f32>()),
+        ));
+    }
+    for mp in map.get_all_map_points() {
+        if mp.is_bad() {
+            continue;
+        }
+        let Some(ref_kf) = mp.get_reference_keyframe() else {
+            continue;
+        };
+        let Some(&ridx) = idx.get(&ref_kf.id) else {
+            continue;
+        };
+        let corrected_p3dw =
+            vcorrected_swc[ridx].map(&vscw[ridx].map(&mp.get_world_pos().cast::<f64>()));
+        mp.set_world_pos(corrected_p3dw.cast::<f32>());
+        mp.update_normal_and_depth();
+    }
+    map.increase_change_index();
+}
+
 // ===========================================================================
 // MergeInertialBA
 // ===========================================================================
@@ -2797,7 +3287,12 @@ pub fn optimize_essential_graph_4dof_core(
 /// keyframes just before each window held fixed. Builds on the validated
 /// [`inertial_ba_core`]; the covisible visual-only keyframes upstream adds as
 /// pose-only vertices are included here as fixed inertial keyframes.
-pub fn merge_inertial_ba(curr_kf: &Arc<KeyFrame>, merge_kf: &Arc<KeyFrame>, map: &Map) {
+pub fn merge_inertial_ba(
+    curr_kf: &Arc<KeyFrame>,
+    merge_kf: &Arc<KeyFrame>,
+    stop_flag: Option<Arc<AtomicBool>>,
+    map: &Map,
+) -> KeyFrameAndPose {
     let nd = 6usize;
     // Window back from current KF.
     let mut window: Vec<Arc<KeyFrame>> = vec![curr_kf.clone()];
@@ -2922,7 +3417,7 @@ pub fn merge_inertial_ba(curr_kf: &Arc<KeyFrame>, merge_kf: &Arc<KeyFrame>, map:
         }
     }
 
-    let r = inertial_ba_core(&kfs, &links, &points, &obs, 8, 1e0, None);
+    let r = inertial_ba_core(&kfs, &links, &points, &obs, 8, 1e0, stop_flag);
     let (states, out_points) = (r.states, r.points);
 
     for (i, k) in kf_arcs.iter().take(n_opt).enumerate() {
@@ -2943,6 +3438,16 @@ pub fn merge_inertial_ba(curr_kf: &Arc<KeyFrame>, merge_kf: &Arc<KeyFrame>, map:
         mp.update_normal_and_depth();
     }
     map.increase_change_index();
+
+    // Corrected poses of the optimized keyframes (`corrPoses` output).
+    let mut corr_poses = KeyFrameAndPose::new();
+    for (i, k) in kf_arcs.iter().take(n_opt).enumerate() {
+        corr_poses.insert(
+            k.id,
+            sim3_from_pose(&imu_state_to_tcw(&states[i], &kfs[i].rbc, &kfs[i].tbc)),
+        );
+    }
+    corr_poses
 }
 
 // ===========================================================================

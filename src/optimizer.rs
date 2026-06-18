@@ -2144,10 +2144,25 @@ pub enum InertialBaObs {
     },
 }
 
+/// Result of [`inertial_ba_core`]: optimized states + points plus per-edge
+/// diagnostics for outlier culling.
+pub struct InertialBaResult {
+    pub states: Vec<ImuState>,
+    pub points: Vec<Vector3<f64>>,
+    /// Per-observation `χ²` (input order).
+    pub obs_chi2: Vec<f64>,
+    /// Per-observation depth positivity.
+    pub obs_depth_positive: Vec<bool>,
+    /// Active robust χ² before / after optimization (for the divergence guard).
+    pub err_start: f64,
+    pub err_end: f64,
+}
+
 /// Shared core for the inertial bundle-adjustment routines (`FullInertialBA`,
 /// `LocalInertialBA`, `MergeInertialBA`): keyframe pose/velocity/bias vertices,
 /// `EdgeInertial` + bias random-walk links, reprojection edges to marginalized
-/// points, Levenberg-Marquardt. Returns optimized states + point positions.
+/// points, Levenberg-Marquardt. Returns optimized states/points + per-edge
+/// diagnostics.
 pub fn inertial_ba_core(
     kfs: &[InertialBaKf],
     links: &[InertialLink],
@@ -2155,10 +2170,14 @@ pub fn inertial_ba_core(
     obs: &[InertialBaObs],
     n_iterations: i32,
     user_lambda_init: f64,
-) -> (Vec<ImuState>, Vec<Vector3<f64>>) {
+    stop_flag: Option<Arc<AtomicBool>>,
+) -> InertialBaResult {
     let mut opt = SparseOptimizer::new();
     if user_lambda_init > 0.0 {
         opt.set_user_lambda_init(user_lambda_init);
+    }
+    if let Some(f) = stop_flag {
+        opt.set_force_stop_flag(f);
     }
 
     struct KfV {
@@ -2233,8 +2252,9 @@ pub fn inertial_ba_core(
         v.set_marginalized(true);
         mpv.push(opt.add_vertex(Box::new(v)));
     }
+    let mut obs_edges: Vec<usize> = Vec::with_capacity(obs.len());
     for o in obs {
-        match o {
+        let ei = match o {
             InertialBaObs::Mono {
                 kf,
                 mp,
@@ -2246,7 +2266,7 @@ pub fn inertial_ba_core(
                 e.set_measurement(*obs);
                 e.set_information(nalgebra::Matrix2::identity() * *inv_sigma2);
                 e.set_robust_kernel(Some(th_mono));
-                opt.add_edge(Box::new(e));
+                opt.add_edge(Box::new(e))
             }
             InertialBaObs::Stereo {
                 kf,
@@ -2259,13 +2279,24 @@ pub fn inertial_ba_core(
                 e.set_measurement(*obs);
                 e.set_information(nalgebra::Matrix3::identity() * *inv_sigma2);
                 e.set_robust_kernel(Some(th_stereo));
-                opt.add_edge(Box::new(e));
+                opt.add_edge(Box::new(e))
             }
-        }
+        };
+        obs_edges.push(ei);
     }
 
     opt.initialize_optimization(0);
+    opt.compute_active_errors();
+    let err_start = opt.active_robust_chi2();
     opt.optimize(n_iterations);
+    opt.compute_active_errors();
+    let err_end = opt.active_robust_chi2();
+
+    let obs_chi2: Vec<f64> = obs_edges.iter().map(|&ei| opt.edge(ei).chi2()).collect();
+    let obs_depth_positive: Vec<bool> = obs_edges
+        .iter()
+        .map(|&ei| opt.edge_depth_positive(ei))
+        .collect();
 
     let states = kfv
         .iter()
@@ -2310,7 +2341,14 @@ pub fn inertial_ba_core(
                 .estimate()
         })
         .collect();
-    (states, out_points)
+    InertialBaResult {
+        states,
+        points: out_points,
+        obs_chi2,
+        obs_depth_positive,
+        err_start,
+        err_end,
+    }
 }
 
 /// Build an [`InertialBaKf`] / [`ImuState`] from a keyframe.
@@ -2453,7 +2491,8 @@ pub fn full_inertial_ba(map: &Map, iterations: i32, loop_kf: u64, b_fix_local: b
         }
     }
 
-    let (states, out_points) = inertial_ba_core(&kfs, &links, &points, &obs, iterations, 1e-5);
+    let r = inertial_ba_core(&kfs, &links, &points, &obs, iterations, 1e-5, None);
+    let (states, out_points) = (r.states, r.points);
 
     let direct = loop_kf == 0;
     for (i, kf) in kf_arcs.iter().enumerate() {
@@ -2490,10 +2529,17 @@ pub fn full_inertial_ba(map: &Map, iterations: i32, loop_kf: u64, b_fix_local: b
 /// Inertial bundle adjustment over a temporal window of recent keyframes
 /// (with the keyframe just before the window held fixed) plus the map points
 /// they observe. Builds on the validated [`inertial_ba_core`].
-pub fn local_inertial_ba(kf: &Arc<KeyFrame>, map: &Map, b_large: bool) {
-    let opt_it = if b_large { 4 } else { 10 };
-    let user_lambda = if b_large { 1e-2 } else { 1e0 };
-    let max_opt = if b_large { 25 } else { 10 };
+#[allow(clippy::type_complexity)]
+pub fn local_inertial_ba(
+    kf: &Arc<KeyFrame>,
+    stop_flag: Option<Arc<AtomicBool>>,
+    map: &Map,
+    large: bool,
+    rec_init: bool,
+) -> (usize, usize, usize, usize) {
+    let opt_it = if large { 4 } else { 10 };
+    let user_lambda = if large { 1e-2 } else { 1e0 };
+    let max_opt = if large { 25 } else { 10 };
     let nd = ((map.key_frames_in_map() as i64 - 2).min(max_opt)).max(0) as usize;
 
     // Temporal window: current KF + its `Nd` predecessors via prev links.
@@ -2546,13 +2592,14 @@ pub fn local_inertial_ba(kf: &Arc<KeyFrame>, map: &Map, b_large: bool) {
         let Some(preint) = wkf.imu_preintegrated.clone() else {
             continue;
         };
-        // Last link (window boundary): downweight + robust (mirrors upstream).
+        // Boundary link (window edge) or bRecInit: robust kernel; boundary also
+        // down-weights the information (mirrors upstream).
         let is_boundary = i == n_window - 1;
         links.push(InertialLink {
             prev: pi,
             cur: ci,
             preint,
-            robust_delta: if is_boundary {
+            robust_delta: if is_boundary || rec_init {
                 Some(16.92_f64.sqrt())
             } else {
                 None
@@ -2569,6 +2616,8 @@ pub fn local_inertial_ba(kf: &Arc<KeyFrame>, map: &Map, b_large: bool) {
         points.push(mp.get_world_pos().cast::<f64>());
     }
     let mut obs: Vec<InertialBaObs> = Vec::new();
+    // Parallel metadata per observation for outlier culling.
+    let mut obs_meta: Vec<(Arc<KeyFrame>, Arc<MapPoint>, bool, f32)> = Vec::new();
     for mp in &local_mps {
         let mp_i = mp_index[&mp.id];
         for (obs_kf, (left, _right)) in mp.get_observations() {
@@ -2582,7 +2631,8 @@ pub fn local_inertial_ba(kf: &Arc<KeyFrame>, map: &Map, b_large: bool) {
             let li = left as usize;
             let kp = &obs_kf.keys_un[li];
             let inv_sigma2 = obs_kf.inv_level_sigma2[kp.octave() as usize] as f64;
-            if obs_kf.u_right[li] < 0.0 {
+            let is_mono = obs_kf.u_right[li] < 0.0;
+            if is_mono {
                 obs.push(InertialBaObs::Mono {
                     kf: kf_i,
                     mp: mp_i,
@@ -2603,14 +2653,47 @@ pub fn local_inertial_ba(kf: &Arc<KeyFrame>, map: &Map, b_large: bool) {
                     cam_idx: 0,
                 });
             }
+            obs_meta.push((obs_kf.clone(), mp.clone(), is_mono, mp.track_depth));
         }
     }
 
-    let (states, out_points) = inertial_ba_core(&kfs, &links, &points, &obs, opt_it, user_lambda);
+    let num_fixed = fixed_boundary.is_some() as usize;
+    let num_opt = window.len();
+    let num_mps = local_mps.len();
+    let num_edges = obs.len();
+
+    let r = inertial_ba_core(&kfs, &links, &points, &obs, opt_it, user_lambda, stop_flag);
+
+    // Divergence guard (mirrors upstream): bail without applying the result.
+    if (2.0 * r.err_start < r.err_end || r.err_start.is_nan() || r.err_end.is_nan()) && !large {
+        return (num_fixed, num_opt, num_mps, num_edges);
+    }
+
+    // Cull outlier observations (chi2 / depth), erasing the matches.
+    let chi2_mono = 5.991;
+    let chi2_stereo = 7.815;
+    for (oi, (obs_kf, mp, is_mono, track_depth)) in obs_meta.iter().enumerate() {
+        if mp.is_bad() {
+            continue;
+        }
+        let chi2 = r.obs_chi2[oi];
+        let bad = if *is_mono {
+            let b_close = *track_depth < 10.0;
+            (chi2 > chi2_mono && !b_close)
+                || (chi2 > 1.5 * chi2_mono && b_close)
+                || !r.obs_depth_positive[oi]
+        } else {
+            chi2 > chi2_stereo
+        };
+        if bad {
+            obs_kf.erase_map_point_match(mp);
+            mp.erase_observation(obs_kf);
+        }
+    }
 
     // Write back the window keyframes (skip the fixed boundary).
     for (i, wkf) in window.iter().enumerate() {
-        let s = &states[i];
+        let s = &r.states[i];
         wkf.set_pose(imu_state_to_tcw(s, &kfs[i].rbc, &kfs[i].tbc));
         wkf.set_velocity(s.vel.cast::<f32>());
         wkf.set_new_bias(crate::imu_types::Bias::from_params(
@@ -2622,11 +2705,12 @@ pub fn local_inertial_ba(kf: &Arc<KeyFrame>, map: &Map, b_large: bool) {
             s.bg[2] as f32,
         ));
     }
-    for (mp, p) in local_mps.iter().zip(out_points.iter()) {
+    for (mp, p) in local_mps.iter().zip(r.points.iter()) {
         mp.set_world_pos(p.cast::<f32>());
         mp.update_normal_and_depth();
     }
     map.increase_change_index();
+    (num_fixed, num_opt, num_mps, num_edges)
 }
 
 // ===========================================================================
@@ -2838,7 +2922,8 @@ pub fn merge_inertial_ba(curr_kf: &Arc<KeyFrame>, merge_kf: &Arc<KeyFrame>, map:
         }
     }
 
-    let (states, out_points) = inertial_ba_core(&kfs, &links, &points, &obs, 8, 1e0);
+    let r = inertial_ba_core(&kfs, &links, &points, &obs, 8, 1e0, None);
+    let (states, out_points) = (r.states, r.points);
 
     for (i, k) in kf_arcs.iter().take(n_opt).enumerate() {
         let s = &states[i];
@@ -2861,7 +2946,300 @@ pub fn merge_inertial_ba(curr_kf: &Arc<KeyFrame>, merge_kf: &Arc<KeyFrame>, map:
 }
 
 // ===========================================================================
-// OptimizeEssentialGraph
+// OptimizeEssentialGraph (real &Map wrappers)
+// ===========================================================================
+
+/// Stub of `LoopClosing::KeyFrameAndPose`: keyframe id -> corrected `Sim3` (`Scw`).
+pub type KeyFrameAndPose = HashMap<u64, Sim3>;
+/// Stub of the loop-connection map: keyframe id -> set of connected keyframe ids.
+pub type LoopConnections = HashMap<u64, HashSet<u64>>;
+
+fn sim3_from_pose(tcw: &Isometry3<f32>) -> Sim3 {
+    Sim3::new(
+        tcw.rotation.cast::<f64>(),
+        tcw.translation.vector.cast::<f64>(),
+        1.0,
+    )
+}
+
+/// `Optimizer::OptimizeEssentialGraph` (Optimizer.cc:1501): the loop-closing
+/// Sim3 pose graph. Builds vertices from the (non-)corrected Sim3 maps + KF
+/// poses, adds loop / spanning-tree / loop-edge / covisibility / inertial
+/// `EdgeSim3` constraints, optimizes via [`optimize_essential_graph_core`], then
+/// recovers SE3 keyframe poses and transforms the map points.
+#[allow(clippy::too_many_arguments)]
+pub fn optimize_essential_graph(
+    map: &Map,
+    loop_kf: &Arc<KeyFrame>,
+    cur_kf: &Arc<KeyFrame>,
+    non_corrected: &KeyFrameAndPose,
+    corrected: &KeyFrameAndPose,
+    loop_connections: &LoopConnections,
+    fix_scale: bool,
+) {
+    const MIN_FEAT: i32 = 100;
+    let init_kf_id = map.get_init_kf_id();
+    let mut kfs = map.get_all_key_frames();
+    kfs.sort_by_key(|k| k.id);
+    let max_kf_id = map.get_max_kf_id();
+    kfs.retain(|k| k.id <= max_kf_id && !k.is_bad());
+
+    let idx: HashMap<u64, usize> = kfs.iter().enumerate().map(|(i, k)| (k.id, i)).collect();
+    let n = kfs.len();
+
+    // Per-keyframe initial Scw (corrected if available, else the current pose).
+    let mut vscw: Vec<Sim3> = Vec::with_capacity(n);
+    let mut poses: Vec<Sim3> = Vec::with_capacity(n);
+    let mut fixed = vec![false; n];
+    for (i, kf) in kfs.iter().enumerate() {
+        let siw = corrected
+            .get(&kf.id)
+            .copied()
+            .unwrap_or_else(|| sim3_from_pose(&kf.get_pose()));
+        vscw.push(siw);
+        poses.push(siw);
+        if kf.id == init_kf_id {
+            fixed[i] = true;
+        }
+    }
+    // `Siw` as used for edge measurements (non-corrected if present).
+    let siw_for = |kf: &Arc<KeyFrame>| -> Sim3 {
+        non_corrected
+            .get(&kf.id)
+            .copied()
+            .unwrap_or(vscw[idx[&kf.id]])
+    };
+
+    let mut edges: Vec<EssentialGraphEdge> = Vec::new();
+    let mut inserted: HashSet<(u64, u64)> = HashSet::new();
+    let key = |a: u64, b: u64| (a.min(b), a.max(b));
+
+    // Loop edges (LoopConnections).
+    for (&id_i, conns) in loop_connections.iter() {
+        let Some(&i) = idx.get(&id_i) else { continue };
+        let siw = vscw[i];
+        let swi = siw.inverse();
+        let kf_i = &kfs[i];
+        for &id_j in conns {
+            let Some(&j) = idx.get(&id_j) else { continue };
+            // Keep the (cur,loop) edge unconditionally, else require min weight.
+            if (id_i != cur_kf.id || id_j != loop_kf.id) && kf_i.get_weight(&kfs[j]) < MIN_FEAT {
+                continue;
+            }
+            let sji = vscw[j].mul(&swi);
+            edges.push(EssentialGraphEdge { i, j, sji });
+            inserted.insert(key(id_i, id_j));
+        }
+    }
+
+    // Normal edges: spanning tree, loop edges, covisibility, inertial.
+    for (i, kf) in kfs.iter().enumerate() {
+        let swi = siw_for(kf).inverse();
+
+        if let Some(parent) = kf.get_parent() {
+            if let Some(&j) = idx.get(&parent.id) {
+                let sjw = siw_for(&parent);
+                edges.push(EssentialGraphEdge {
+                    i,
+                    j,
+                    sji: sjw.mul(&swi),
+                });
+            }
+        }
+        for lkf in kf.get_loop_edges() {
+            if lkf.id < kf.id {
+                if let Some(&j) = idx.get(&lkf.id) {
+                    let slw = siw_for(&lkf);
+                    edges.push(EssentialGraphEdge {
+                        i,
+                        j,
+                        sji: slw.mul(&swi),
+                    });
+                }
+            }
+        }
+        for nkf in kf.get_covisibles_by_weight(MIN_FEAT) {
+            let is_parent = kf.get_parent().map(|p| p.id == nkf.id).unwrap_or(false);
+            if is_parent || kf.has_child(&nkf) || nkf.is_bad() || nkf.id >= kf.id {
+                continue;
+            }
+            if inserted.contains(&key(kf.id, nkf.id)) {
+                continue;
+            }
+            if let Some(&j) = idx.get(&nkf.id) {
+                let snw = siw_for(&nkf);
+                edges.push(EssentialGraphEdge {
+                    i,
+                    j,
+                    sji: snw.mul(&swi),
+                });
+            }
+        }
+        if kf.imu {
+            if let Some(prev) = kf.get_prev_kf() {
+                if let Some(&j) = idx.get(&prev.id) {
+                    let spw = siw_for(&prev);
+                    edges.push(EssentialGraphEdge {
+                        i,
+                        j,
+                        sji: spw.mul(&swi),
+                    });
+                }
+            }
+        }
+    }
+
+    let corrected_siw = optimize_essential_graph_core(&poses, &fixed, fix_scale, &edges, 20);
+
+    // Recover SE3 keyframe poses (Sim3 [sR t] -> SE3 [R t/s]).
+    let mut vcorrected_swc: Vec<Sim3> = Vec::with_capacity(n);
+    for (i, kf) in kfs.iter().enumerate() {
+        let csiw = corrected_siw[i];
+        vcorrected_swc.push(csiw.inverse());
+        let s = csiw.scale();
+        let tiw = Isometry3::from_parts(
+            nalgebra::Translation3::from((csiw.translation() / s).cast::<f32>()),
+            csiw.rotation().cast::<f32>(),
+        );
+        kf.set_pose(tiw);
+    }
+
+    // Transform map points by their reference keyframe's correction.
+    for mp in map.get_all_map_points() {
+        if mp.is_bad() {
+            continue;
+        }
+        let Some(ref_kf) = mp.get_reference_keyframe() else {
+            continue;
+        };
+        let Some(&ridx) = idx.get(&ref_kf.id) else {
+            continue;
+        };
+        let srw = vscw[ridx];
+        let corrected_swr = vcorrected_swc[ridx];
+        let p3dw = mp.get_world_pos().cast::<f64>();
+        let corrected_p3dw = corrected_swr.map(&srw.map(&p3dw));
+        mp.set_world_pos(corrected_p3dw.cast::<f32>());
+        mp.update_normal_and_depth();
+    }
+    map.increase_change_index();
+}
+
+/// `Optimizer::OptimizeEssentialGraph` 2nd overload (Optimizer.cc:1785): the
+/// map-merge welding pose graph. `fixed_kfs` (and `fixed_corrected_kfs`) keep
+/// their pose; `non_fixed_kfs` are optimized; `non_corrected_mps` are
+/// transformed by their reference keyframe's correction afterwards.
+pub fn optimize_essential_graph_merge(
+    cur_kf: &Arc<KeyFrame>,
+    fixed_kfs: &[Arc<KeyFrame>],
+    fixed_corrected_kfs: &[Arc<KeyFrame>],
+    non_fixed_kfs: &[Arc<KeyFrame>],
+    non_corrected_mps: &[Arc<MapPoint>],
+) {
+    const MIN_FEAT: i32 = 100;
+    let Some(map) = cur_kf.get_map() else { return };
+
+    // Collect all participating keyframes (fixed + fixed-corrected + non-fixed).
+    let mut kfs: Vec<Arc<KeyFrame>> = Vec::new();
+    let mut fixed_flags: Vec<bool> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    for (group, is_fixed) in [
+        (fixed_kfs, true),
+        (fixed_corrected_kfs, true),
+        (non_fixed_kfs, false),
+    ] {
+        for kf in group {
+            if !kf.is_bad() && seen.insert(kf.id) {
+                kfs.push(kf.clone());
+                fixed_flags.push(is_fixed);
+            }
+        }
+    }
+    if kfs.is_empty() {
+        return;
+    }
+    let idx: HashMap<u64, usize> = kfs.iter().enumerate().map(|(i, k)| (k.id, i)).collect();
+
+    // Initial Scw from current keyframe poses.
+    let vscw: Vec<Sim3> = kfs.iter().map(|k| sim3_from_pose(&k.get_pose())).collect();
+    let poses = vscw.clone();
+    let siw_for = |kf: &Arc<KeyFrame>| -> Sim3 { vscw[idx[&kf.id]] };
+
+    let mut edges: Vec<EssentialGraphEdge> = Vec::new();
+    let mut inserted: HashSet<(u64, u64)> = HashSet::new();
+    let key = |a: u64, b: u64| (a.min(b), a.max(b));
+    for (i, kf) in kfs.iter().enumerate() {
+        let swi = siw_for(kf).inverse();
+        if let Some(parent) = kf.get_parent() {
+            if let Some(&j) = idx.get(&parent.id) {
+                edges.push(EssentialGraphEdge {
+                    i,
+                    j,
+                    sji: siw_for(&parent).mul(&swi),
+                });
+                inserted.insert(key(kf.id, parent.id));
+            }
+        }
+        for lkf in kf.get_loop_edges() {
+            if let Some(&j) = idx.get(&lkf.id) {
+                if kf.id < lkf.id {
+                    edges.push(EssentialGraphEdge {
+                        i,
+                        j,
+                        sji: siw_for(&lkf).mul(&swi),
+                    });
+                    inserted.insert(key(kf.id, lkf.id));
+                }
+            }
+        }
+        for nkf in kf.get_covisibles_by_weight(MIN_FEAT) {
+            if nkf.is_bad() || nkf.id >= kf.id || inserted.contains(&key(kf.id, nkf.id)) {
+                continue;
+            }
+            if let Some(&j) = idx.get(&nkf.id) {
+                edges.push(EssentialGraphEdge {
+                    i,
+                    j,
+                    sji: siw_for(&nkf).mul(&swi),
+                });
+                inserted.insert(key(kf.id, nkf.id));
+            }
+        }
+    }
+
+    let corrected_siw = optimize_essential_graph_core(&poses, &fixed_flags, true, &edges, 20);
+
+    let mut vcorrected_swc: Vec<Sim3> = Vec::with_capacity(kfs.len());
+    for (i, kf) in kfs.iter().enumerate() {
+        let csiw = corrected_siw[i];
+        vcorrected_swc.push(csiw.inverse());
+        let s = csiw.scale();
+        let tiw = Isometry3::from_parts(
+            nalgebra::Translation3::from((csiw.translation() / s).cast::<f32>()),
+            csiw.rotation().cast::<f32>(),
+        );
+        kf.set_pose(tiw);
+    }
+    for mp in non_corrected_mps {
+        if mp.is_bad() {
+            continue;
+        }
+        let Some(ref_kf) = mp.get_reference_keyframe() else {
+            continue;
+        };
+        let Some(&ridx) = idx.get(&ref_kf.id) else {
+            continue;
+        };
+        let corrected_p3dw =
+            vcorrected_swc[ridx].map(&vscw[ridx].map(&mp.get_world_pos().cast::<f64>()));
+        mp.set_world_pos(corrected_p3dw.cast::<f32>());
+        mp.update_normal_and_depth();
+    }
+    map.increase_change_index();
+}
+
+// ===========================================================================
+// OptimizeEssentialGraph (core)
 // ===========================================================================
 
 /// A relative-Sim3 constraint `Sji` between vertices `i` (slot 0) and `j`

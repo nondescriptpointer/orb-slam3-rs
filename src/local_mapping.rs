@@ -44,6 +44,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tracing::info;
 
+use crate::optimizer;
 use crate::{
     atlas::Atlas, key_frame::KeyFrame, loop_closing::LoopClosing, map::Map, map_point::MapPoint,
     system::System, tracking::Tracking,
@@ -332,7 +333,7 @@ impl LocalMapping {
                                         {
                                             let mut reset = self.reset.lock().unwrap();
                                             reset.reset_requested_active_map = true;
-                                            reset.map_to_reset = Some(map);
+                                            reset.map_to_reset = Some(map.clone());
                                             self.bad_imu.store(true, Ordering::SeqCst);
                                         }
                                     }
@@ -341,7 +342,14 @@ impl LocalMapping {
                                 let inliers = self.tracker.get().unwrap().get_matches_inliers();
                                 let large = ((inliers > 75) && self.monocular)
                                     || ((inliers > 100) && !self.monocular);
-                                // TODO: Optimizer
+                                optimizer::local_inertial_ba(
+                                    current_keyframe,
+                                    None,
+                                    &map,
+                                    large,
+                                    false,
+                                );
+
                                 done_lba = true;
                             }
                         } else {

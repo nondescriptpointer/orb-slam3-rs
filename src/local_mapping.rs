@@ -375,13 +375,48 @@ impl LocalMapping {
                         && self.inertial
                     {
                         if self.monocular {
+                            // TODO
                         } else {
+                            // TODO
                         }
                     }
+
+                    // TODO
                 }
                 // TODO
             }
         }
+    }
+
+    fn initialize_imu(&mut self, prior_g: f32, prior_a: f32, fiba: bool) {
+        if self.reset.lock().unwrap().reset_requested {
+            return;
+        }
+
+        let (min_time, min_kf): (f32, usize) = if self.monocular { (2.0, 10) } else { (1.0, 10) };
+
+        if let Some(keyframes) = self.atlas.key_frames_in_map()
+            && keyframes < min_kf
+        {
+            return;
+        }
+
+        // Retrieve all keyframe in temporal order
+        let mut kfs: Vec<Arc<KeyFrame>> = Vec::new();
+        let mut current = self.current_key_frame.lock().unwrap().clone();
+        while let Some(kf) = current {
+            kfs.push(kf.clone());
+            current = kf.get_prev_kf().clone();
+        }
+        kfs.reverse();
+
+        if kfs.len() < min_kf {
+            return;
+        }
+
+        let first_ts = kfs[0].timestamp;
+
+        // TODO
     }
 
     /// Enqueue a keyframe and request BA abort (upstream `InsertKeyFrame`).
